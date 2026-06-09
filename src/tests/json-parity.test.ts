@@ -291,11 +291,15 @@ test("parallel aliases pass explicit cue profile per Claude account", async () =
     assert.match(parsedAliases.data.aliases, /__authmux_claude_account\(\)/);
     assert.match(
       parsedAliases.data.aliases,
-      /cue launch claude --cue-profile "\$profile"/,
+      /authmux skills activate "\$skill_profile" --agent claude/,
     );
     assert.match(
       parsedAliases.data.aliases,
-      /alias claude-account2="__authmux_claude_account 'account2' 'frontend'"/,
+      /cue launch claude --cue-profile "\$cue_profile"/,
+    );
+    assert.match(
+      parsedAliases.data.aliases,
+      /alias claude-account2="__authmux_claude_account 'account2' 'frontend' 'frontend'"/,
     );
   });
 });
