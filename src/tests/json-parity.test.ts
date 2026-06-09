@@ -250,3 +250,52 @@ for (const tc of CASES) {
     });
   });
 }
+
+test("parallel aliases pass explicit cue profile per Claude account", async () => {
+  await withSandbox(async (env) => {
+    const addDefault = runCli(
+      ["parallel", "--add", "account1", "--json"],
+      env,
+    );
+    assert.equal(addDefault.status, 0, addDefault.stderr);
+
+    const parsedDefault = JSON.parse(addDefault.stdout.trim()) as {
+      ok: true;
+      data: { profile: string; skillProfile: string; cueProfile: string };
+    };
+    assert.equal(parsedDefault.data.profile, "account1");
+    assert.equal(parsedDefault.data.skillProfile, "base");
+    assert.equal(parsedDefault.data.cueProfile, "core");
+
+    const add = runCli(
+      ["parallel", "--add", "account2", "--skill-profile", "frontend", "--json"],
+      env,
+    );
+    assert.equal(add.status, 0, add.stderr);
+
+    const parsedAdd = JSON.parse(add.stdout.trim()) as {
+      ok: true;
+      data: { profile: string; skillProfile: string; cueProfile: string };
+    };
+    assert.equal(parsedAdd.data.profile, "account2");
+    assert.equal(parsedAdd.data.skillProfile, "frontend");
+    assert.equal(parsedAdd.data.cueProfile, "frontend");
+
+    const aliases = runCli(["parallel", "--aliases", "--json"], env);
+    assert.equal(aliases.status, 0, aliases.stderr);
+
+    const parsedAliases = JSON.parse(aliases.stdout.trim()) as {
+      ok: true;
+      data: { aliases: string };
+    };
+    assert.match(parsedAliases.data.aliases, /__authmux_claude_account\(\)/);
+    assert.match(
+      parsedAliases.data.aliases,
+      /cue launch claude --cue-profile "\$profile"/,
+    );
+    assert.match(
+      parsedAliases.data.aliases,
+      /alias claude-account2="__authmux_claude_account 'account2' 'frontend'"/,
+    );
+  });
+});

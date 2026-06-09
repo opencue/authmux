@@ -14,6 +14,8 @@ import {
 
 const CLAUDE_PARALLEL_DIR = path.join(os.homedir(), ".claude-accounts");
 const SKILL_PROFILE_FILE = ".authmux-skill-profile";
+const CUE_PROFILE_FILE = ".authmux-cue-profile";
+const DEFAULT_CUE_PROFILE = "core";
 
 function getProfiles(): string[] {
   if (!fs.existsSync(CLAUDE_PARALLEL_DIR)) return [];
@@ -45,6 +47,18 @@ function writeSkillProfile(name: string, skillProfile: string): void {
   fs.writeFileSync(file, `${skillProfile.trim()}\n`);
 }
 
+function readCueProfile(name: string): string | undefined {
+  const file = path.join(CLAUDE_PARALLEL_DIR, name, CUE_PROFILE_FILE);
+  if (!fs.existsSync(file)) return undefined;
+  const profile = fs.readFileSync(file, "utf8").trim();
+  return profile.length > 0 ? profile : undefined;
+}
+
+function writeCueProfile(name: string, cueProfile: string): void {
+  const file = path.join(CLAUDE_PARALLEL_DIR, name, CUE_PROFILE_FILE);
+  fs.writeFileSync(file, `${cueProfile.trim()}\n`);
+}
+
 export default class ClaudeParallel extends Command {
   static description = "Manage parallel Claude Code accounts via CLAUDE_CONFIG_DIR";
 
@@ -55,6 +69,7 @@ export default class ClaudeParallel extends Command {
     install: Flags.boolean({ description: "Install aliases into shell rc file" }),
     list: Flags.boolean({ char: "l", description: "List profiles" }),
     "skill-profile": Flags.string({ description: "Soul skill profile for this Claude profile" }),
+    "cue-profile": Flags.string({ description: "Cue profile used by generated claude-<name> aliases" }),
     json: Flags.boolean({
       description: "Emit a single JSON envelope to stdout (Theme X4).",
       default: false,
@@ -77,7 +92,7 @@ export default class ClaudeParallel extends Command {
     this.jsonMode = Boolean(flags.json);
 
     if (flags.add) {
-      this.addProfile(flags.add, flags["skill-profile"]);
+      this.addProfile(flags.add, flags["skill-profile"], flags["cue-profile"]);
     } else if (flags.remove) {
       this.removeProfile(flags.remove);
     } else if (flags.install) {
@@ -89,7 +104,7 @@ export default class ClaudeParallel extends Command {
     }
   }
 
-  private addProfile(name: string, skillProfile?: string): void {
+  private addProfile(name: string, skillProfile?: string, cueProfile?: string): void {
     const dir = path.join(CLAUDE_PARALLEL_DIR, name);
     const existed = fs.existsSync(dir);
     if (!existed) {
@@ -97,6 +112,10 @@ export default class ClaudeParallel extends Command {
     }
     if (skillProfile) {
       writeSkillProfile(name, skillProfile);
+    }
+    const resolvedCueProfile = cueProfile ?? readCueProfile(name) ?? skillProfile ?? DEFAULT_CUE_PROFILE;
+    if (cueProfile || !readCueProfile(name)) {
+      writeCueProfile(name, resolvedCueProfile);
     }
 
     if (this.jsonMode) {
@@ -106,6 +125,7 @@ export default class ClaudeParallel extends Command {
         dir,
         created: !existed,
         skillProfile: skillProfile ?? readSkillProfile(name) ?? "base",
+        cueProfile: resolvedCueProfile,
       }));
       return;
     }
@@ -115,11 +135,13 @@ export default class ClaudeParallel extends Command {
       if (skillProfile) {
         this.log(`  Skill profile: ${skillProfile}`);
       }
+      this.log(`  Cue profile: ${resolvedCueProfile}`);
       return;
     }
     this.log(`Created profile: ${name}`);
     this.log(`  Config dir: ${dir}`);
     this.log(`  Skill profile: ${skillProfile ?? "base"}`);
+    this.log(`  Cue profile: ${resolvedCueProfile}`);
     this.log(`  Run: CLAUDE_CONFIG_DIR=${dir} claude`);
     this.log(`\nTo install shell aliases: agent-auth parallel --install`);
   }
@@ -148,6 +170,7 @@ export default class ClaudeParallel extends Command {
       name: p,
       configDir: path.join(CLAUDE_PARALLEL_DIR, p),
       skillProfile: readSkillProfile(p) ?? "base",
+      cueProfile: readCueProfile(p) ?? readSkillProfile(p) ?? DEFAULT_CUE_PROFILE,
     }));
 
     if (this.jsonMode) {
@@ -165,7 +188,7 @@ export default class ClaudeParallel extends Command {
     }
     this.log("Claude Code parallel profiles:\n");
     for (const p of entries) {
-      this.log(`  • ${p.name}  →  ${p.configDir}  skillProfile=${p.skillProfile}`);
+      this.log(`  • ${p.name}  →  ${p.configDir}  skillProfile=${p.skillProfile} cueProfile=${p.cueProfile}`);
     }
     this.log(`\nRun any profile: claude-<name> (after installing aliases)`);
   }
@@ -175,18 +198,21 @@ export default class ClaudeParallel extends Command {
     if (!profiles.length) return "";
     const lines = [
       "# Claude Code parallel accounts (managed by agent-auth)",
+      "__authmux_claude_account() {",
+      "  local name=\"$1\"",
+      `  local profile="\${2:-${DEFAULT_CUE_PROFILE}}"`,
+      "  shift 2",
+      "  local dir=\"$HOME/.claude-accounts/$name\"",
+      "  command authmux skills activate \"$profile\" --agent claude --target \"$dir/skills\" >/dev/null 2>&1 || true",
+      "  if command -v cue >/dev/null 2>&1 && [ -z \"${AUTHMUX_SKIP_CUE_LAUNCH:-}\" ]; then",
+      "    CLAUDE_CONFIG_DIR=\"$dir\" cue launch claude --cue-profile \"$profile\" \"$@\"",
+      "  else",
+      "    CLAUDE_CONFIG_DIR=\"$dir\" command claude \"$@\"",
+      "  fi",
+      "}",
       ...profiles.map((p) => {
-        const dir = path.join(CLAUDE_PARALLEL_DIR, p);
-        const profile = readSkillProfile(p) ?? "base";
-        const activate = [
-          "command authmux skills activate",
-          shellQuote(profile),
-          "--agent claude",
-          "--target",
-          shellQuote(path.join(dir, "skills")),
-          ">/dev/null 2>&1 || true",
-        ].join(" ");
-        return `alias claude-${p}="${activate}; CLAUDE_CONFIG_DIR=${shellQuote(dir)} command claude"`;
+        const profile = readCueProfile(p) ?? readSkillProfile(p) ?? DEFAULT_CUE_PROFILE;
+        return `alias claude-${p}="__authmux_claude_account ${shellQuote(p)} ${shellQuote(profile)}"`;
       }),
     ];
     return lines.join("\n");

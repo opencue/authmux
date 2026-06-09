@@ -47,7 +47,21 @@ export function renderLoginHookBlock(): string {
     "  [[ -w \"$__tty_target\" ]] || __tty_target=/dev/stdout",
     "  printf '\\033[>4m\\033[<u\\033[?2026l\\033[?1004l\\033[?1l\\033[?2004l\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1006l\\033[?1015l\\033[?1049l\\033[0m\\033[?25h\\033[H\\033>' >\"$__tty_target\" 2>/dev/null || true",
     "}",
+    "__authmux_ensure_session_key() {",
+    "  if [[ -n \"${CODEX_AUTH_SESSION_KEY:-}\" ]]; then",
+    "    return 0",
+    "  fi",
+    "  local __authmux_tty=\"${TTY:-}\"",
+    "  if [[ -z \"$__authmux_tty\" ]] && command -v tty >/dev/null 2>&1; then",
+    "    __authmux_tty=\"$(tty 2>/dev/null || true)\"",
+    "  fi",
+    "  if [[ -z \"$__authmux_tty\" || \"$__authmux_tty\" == \"not a tty\" ]]; then",
+    "    __authmux_tty=\"ppid:${PPID:-$$}\"",
+    "  fi",
+    "  export CODEX_AUTH_SESSION_KEY=\"terminal:${__authmux_tty}:$$\"",
+    "}",
     "codex() {",
+    "  __authmux_ensure_session_key",
     "  if command -v authmux >/dev/null 2>&1; then",
     "    command authmux restore-session >/dev/null 2>&1 || true",
     "    command authmux skills activate-current --agent codex >/dev/null 2>&1 || true",
@@ -79,7 +93,7 @@ export async function installLoginHook(rcPath = resolveDefaultShellRcPath()): Pr
 
   if (existing.includes(LOGIN_HOOK_MARK_START) && existing.includes(LOGIN_HOOK_MARK_END)) {
     const refreshed = normalizeRcContents(
-      existing.replace(hookBlockRegex(), `\n${renderLoginHookBlock()}\n`),
+      existing.replace(hookBlockRegex(), () => `\n${renderLoginHookBlock()}\n`),
     );
     if (refreshed === normalizeRcContents(existing)) {
       return "already-installed";
