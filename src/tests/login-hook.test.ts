@@ -67,6 +67,7 @@ test("installLoginHook refreshes an existing legacy hook block", async (t) => {
     const contents = await fsp.readFile(rcPath, "utf8");
     assert.ok(contents.includes("command authmux restore-session"));
     assert.ok(contents.includes("command authmux skills activate-current --agent codex"));
+    assert.ok(contents.includes("cue launch codex --cue-profile \"$__authmux_cue_profile\""));
     assert.ok(contents.includes("CODEX_AUTH_FORCE_EXTERNAL_SYNC=1 command authmux status"));
     assert.ok(contents.includes("__authmux_ensure_session_key"));
     assert.ok(contents.includes("export CODEX_AUTH_SESSION_KEY=\"terminal:${__authmux_tty}:$$\""));
@@ -116,6 +117,9 @@ test("renderLoginHookBlock includes terminal-mode restore guard", () => {
   assert.ok(hook.includes("__authmux_ensure_session_key"));
   assert.ok(hook.includes("command authmux restore-session"));
   assert.ok(hook.includes("command authmux skills activate-current --agent codex"));
+  assert.ok(hook.includes("local __authmux_cue_profile=\"${AUTHMUX_CODEX_CUE_PROFILE:-core}\""));
+  assert.ok(hook.includes("AUTHMUX_SKIP_CUE_LAUNCH"));
+  assert.ok(hook.includes("cue launch codex --cue-profile \"$__authmux_cue_profile\""));
   assert.ok(hook.includes("CODEX_AUTH_FORCE_EXTERNAL_SYNC=1 command authmux status"));
   assert.ok(!hook.includes("__first_non_flag"));
   assert.ok(!hook.includes("if ! typeset -f codex"));
