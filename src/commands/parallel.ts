@@ -200,19 +200,21 @@ export default class ClaudeParallel extends Command {
       "# Claude Code parallel accounts (managed by agent-auth)",
       "__authmux_claude_account() {",
       "  local name=\"$1\"",
-      `  local profile="\${2:-${DEFAULT_CUE_PROFILE}}"`,
-      "  shift 2",
+      "  local skill_profile=\"${2:-base}\"",
+      `  local cue_profile="\${3:-${DEFAULT_CUE_PROFILE}}"`,
+      "  shift 3",
       "  local dir=\"$HOME/.claude-accounts/$name\"",
-      "  command authmux skills activate \"$profile\" --agent claude --target \"$dir/skills\" >/dev/null 2>&1 || true",
+      "  command authmux skills activate \"$skill_profile\" --agent claude --target \"$dir/skills\" >/dev/null 2>&1 || true",
       "  if command -v cue >/dev/null 2>&1 && [ -z \"${AUTHMUX_SKIP_CUE_LAUNCH:-}\" ]; then",
-      "    CLAUDE_CONFIG_DIR=\"$dir\" cue launch claude --cue-profile \"$profile\" \"$@\"",
+      "    CLAUDE_CONFIG_DIR=\"$dir\" cue launch claude --cue-profile \"$cue_profile\" \"$@\"",
       "  else",
       "    CLAUDE_CONFIG_DIR=\"$dir\" command claude \"$@\"",
       "  fi",
       "}",
       ...profiles.map((p) => {
-        const profile = readCueProfile(p) ?? readSkillProfile(p) ?? DEFAULT_CUE_PROFILE;
-        return `alias claude-${p}="__authmux_claude_account ${shellQuote(p)} ${shellQuote(profile)}"`;
+        const skillProfile = readSkillProfile(p) ?? "base";
+        const cueProfile = readCueProfile(p) ?? DEFAULT_CUE_PROFILE;
+        return `alias claude-${p}="__authmux_claude_account ${shellQuote(p)} ${shellQuote(skillProfile)} ${shellQuote(cueProfile)}"`;
       }),
     ];
     return lines.join("\n");
