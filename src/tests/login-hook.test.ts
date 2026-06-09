@@ -68,6 +68,8 @@ test("installLoginHook refreshes an existing legacy hook block", async (t) => {
     assert.ok(contents.includes("command authmux restore-session"));
     assert.ok(contents.includes("command authmux skills activate-current --agent codex"));
     assert.ok(contents.includes("CODEX_AUTH_FORCE_EXTERNAL_SYNC=1 command authmux status"));
+    assert.ok(contents.includes("__authmux_ensure_session_key"));
+    assert.ok(contents.includes("export CODEX_AUTH_SESSION_KEY=\"terminal:${__authmux_tty}:$$\""));
     assert.ok(!contents.includes("# legacy"));
     const startCount = contents.split(LOGIN_HOOK_MARK_START).length - 1;
     assert.equal(startCount, 1);
@@ -109,7 +111,9 @@ test("getLoginHookStatus reflects installed state", async (t) => {
 test("renderLoginHookBlock includes terminal-mode restore guard", () => {
   const hook = renderLoginHookBlock();
   assert.ok(hook.includes("__codex_auth_restore_tty"));
+  assert.ok(hook.includes("__authmux_ensure_session_key"));
   assert.ok(hook.includes("codex() {"));
+  assert.ok(hook.includes("__authmux_ensure_session_key"));
   assert.ok(hook.includes("command authmux restore-session"));
   assert.ok(hook.includes("command authmux skills activate-current --agent codex"));
   assert.ok(hook.includes("CODEX_AUTH_FORCE_EXTERNAL_SYNC=1 command authmux status"));
