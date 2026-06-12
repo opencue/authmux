@@ -206,7 +206,13 @@ export default class ClaudeParallel extends Command {
       "  local dir=\"$HOME/.claude-accounts/$name\"",
       "  command authmux skills activate \"$skill_profile\" --agent claude --target \"$dir/skills\" >/dev/null 2>&1 || true",
       "  if command -v cue >/dev/null 2>&1 && [ -z \"${AUTHMUX_SKIP_CUE_LAUNCH:-}\" ]; then",
-      "    CLAUDE_CONFIG_DIR=\"$dir\" cue launch claude --cue-profile \"$cue_profile\" \"$@\"",
+      // The sentinel `pick` means \"don't force a profile — open cue's selector\".
+      // Any other value is forced via --cue-profile (which suppresses the picker).
+      "    if [ \"$cue_profile\" = \"pick\" ]; then",
+      "      CLAUDE_CONFIG_DIR=\"$dir\" cue launch claude --cue-pick \"$@\"",
+      "    else",
+      "      CLAUDE_CONFIG_DIR=\"$dir\" cue launch claude --cue-profile \"$cue_profile\" \"$@\"",
+      "    fi",
       "  else",
       "    CLAUDE_CONFIG_DIR=\"$dir\" command claude \"$@\"",
       "  fi",
