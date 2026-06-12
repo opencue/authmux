@@ -12,6 +12,10 @@ import {
   resolveDefaultSkillTarget,
 } from "../lib/skills/profile";
 
+// The Soul activator is a POSIX bash script; spawning it directly is not
+// supported on Windows, so activator-backed tests are skipped there.
+const SKIP_POSIX_ONLY = process.platform === "win32" && "Soul activator is a POSIX bash script";
+
 async function withTempSoulHome<T>(fn: (soulHome: string) => Promise<T> | T): Promise<T> {
   const soulHome = await fsp.mkdtemp(path.join(os.tmpdir(), "authmux-soul-"));
   const profilesRoot = path.join(soulHome, "skills", "profiles");
@@ -81,7 +85,7 @@ test("listAvailableSkillProfiles reads Soul profile JSON files", async () => {
   });
 });
 
-test("activateSkillProfile delegates to the Soul activator", async (t) => {
+test("activateSkillProfile delegates to the Soul activator", { skip: SKIP_POSIX_ONLY }, async (t) => {
   await withTempSoulHome(async () => {
     const targetRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "authmux-skills-profile-"));
     t.after(async () => {
@@ -114,7 +118,7 @@ test("resolveDefaultSkillTarget points hermes at hermes-agent/skills", () => {
   try {
     assert.equal(
       resolveDefaultSkillTarget("hermes"),
-      path.join("/tmp/authmux-hermes-fixture", "skills"),
+      path.join(path.resolve("/tmp/authmux-hermes-fixture"), "skills"),
     );
   } finally {
     if (previous === undefined) delete process.env.AUTHMUX_HERMES_HOME;
@@ -127,7 +131,7 @@ test("resolveDefaultSkillTarget returns undefined for codex and claude", () => {
   assert.equal(resolveDefaultSkillTarget("claude"), undefined);
 });
 
-test("activateSkillProfile fills hermes target from env when not given", async (t) => {
+test("activateSkillProfile fills hermes target from env when not given", { skip: SKIP_POSIX_ONLY }, async (t) => {
   await withTempSoulHome(async () => {
     const targetRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "authmux-skills-hermes-"));
     t.after(async () => {
