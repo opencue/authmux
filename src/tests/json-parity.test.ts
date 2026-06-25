@@ -281,17 +281,22 @@ test("parallel aliases pass explicit cue profile per Claude account", async () =
     assert.equal(parsedAdd.data.skillProfile, "frontend");
     assert.equal(parsedAdd.data.cueProfile, "frontend");
 
-    const aliases = runCli(["parallel", "--aliases", "--json"], env);
+    const aliases = runCli(["parallel", "--aliases", "--shell", "bash", "--json"], env);
     assert.equal(aliases.status, 0, aliases.stderr);
 
     const parsedAliases = JSON.parse(aliases.stdout.trim()) as {
       ok: true;
-      data: { aliases: string };
+      data: { aliases: string; shell: string };
     };
+    assert.equal(parsedAliases.data.shell, "bash");
     assert.match(parsedAliases.data.aliases, /__authmux_claude_account\(\)/);
     assert.match(
       parsedAliases.data.aliases,
       /authmux skills activate "\$skill_profile" --agent claude/,
+    );
+    assert.match(
+      parsedAliases.data.aliases,
+      /\[ "\$\{1:-\}" = "login" \]/,
     );
     assert.match(
       parsedAliases.data.aliases,
@@ -301,5 +306,45 @@ test("parallel aliases pass explicit cue profile per Claude account", async () =
       parsedAliases.data.aliases,
       /alias claude-account2="__authmux_claude_account 'account2' 'frontend' 'frontend'"/,
     );
+  });
+});
+
+test("parallel install writes Fish functions with direct login refresh path", async () => {
+  await withSandbox(async (env) => {
+    const addDefault = runCli(
+      ["parallel", "--add", "account1", "--cue-profile", "pick", "--json"],
+      env,
+    );
+    assert.equal(addDefault.status, 0, addDefault.stderr);
+    await fsp.mkdir(path.join(env.HOME as string, ".claude-accounts", ".backup"), {
+      recursive: true,
+    });
+
+    const install = runCli(
+      ["parallel", "--install", "--shell", "fish", "--json"],
+      env,
+    );
+    assert.equal(install.status, 0, install.stderr);
+
+    const parsedInstall = JSON.parse(install.stdout.trim()) as {
+      ok: true;
+      data: { shell: string; files: string[] };
+    };
+    assert.equal(parsedInstall.data.shell, "fish");
+    assert.equal(parsedInstall.data.files.length, 1);
+
+    const functionPath = path.join(
+      env.HOME as string,
+      ".config",
+      "fish",
+      "functions",
+      "claude-account1.fish",
+    );
+    const body = await fsp.readFile(functionPath, "utf8");
+    assert.match(body, /set -lx CLAUDE_CONFIG_DIR "\$dir"/);
+    assert.match(body, /test "\$argv\[1\]" = login/);
+    assert.match(body, /not test -s "\$dir\/\.credentials\.json"/);
+    assert.match(body, /cue launch claude --cue-pick \$argv/);
+    assert.match(body, /command claude \$argv/);
   });
 });
