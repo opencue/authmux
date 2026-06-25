@@ -157,6 +157,11 @@ async function withSandbox<T>(fn: (env: NodeJS.ProcessEnv) => Promise<T>): Promi
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     HOME: tempHome,
+    // `os.homedir()` ignores HOME on Windows and reads USERPROFILE instead, so
+    // without this the sandbox leaks into the real home dir and accounts bleed
+    // across tests (parallel install then sees stale profiles). Setting both
+    // keeps the sandbox isolated on every platform.
+    USERPROFILE: tempHome,
     CODEX_AUTH_CODEX_DIR: codexDir,
     // Make oclif treat stdout as non-TTY so the update-notifier hook stays
     // quiet and no color codes leak into stdout.
