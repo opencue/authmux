@@ -224,6 +224,9 @@ source ~/.bashrc  # or ~/.zshrc
 # Authenticate each in separate terminals
 claude-work       # logs in, credentials saved to ~/.claude-accounts/work
 claude-personal   # logs in, credentials saved to ~/.claude-accounts/personal
+
+# Force a fresh OAuth login for one profile
+authmux parallel --login work
 ```
 
 ### Quick setup (standalone script)
@@ -237,6 +240,7 @@ source ~/.bashrc
 
 ```sh
 authmux parallel --add <name>     # Create a new profile
+authmux parallel --login <name>   # Refresh Claude OAuth inside that profile
 authmux parallel --remove <name>  # Remove a profile
 authmux parallel --list           # List all profiles
 authmux parallel --aliases        # Print aliases (without installing)
@@ -245,7 +249,7 @@ authmux parallel --install        # Write aliases to shell rc file
 
 ### How it works
 
-Each profile gets its own config directory at `~/.claude-accounts/<name>`. Shell aliases set `CLAUDE_CONFIG_DIR` before launching `claude`, so each instance uses isolated credentials, settings, and history. Run them in separate terminal tabs or tmux panes for true parallel usage.
+Each profile gets its own config directory at `~/.claude-accounts/<name>`. Shell aliases/functions set `CLAUDE_CONFIG_DIR` before launching `claude`, so each instance uses isolated credentials, settings, and history. `authmux parallel --install` writes Bash/Zsh aliases or Fish autoload functions based on `$SHELL`. Login and logout commands bypass Cue and run raw Claude against the selected profile so refreshed OAuth tokens are written back to the right account directory. Run profiles in separate terminal tabs or tmux panes for true parallel usage.
 
 ### Notes
 
