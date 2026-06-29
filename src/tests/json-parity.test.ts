@@ -189,6 +189,10 @@ function runCli(argv: string[], env: NodeJS.ProcessEnv): { stdout: string; stder
   };
 }
 
+function lockDirForProfile(home: string, profile: string): string {
+  return path.join(home, ".claude-accounts-locks", `${Buffer.from(profile).toString("base64url")}.sync.lock`);
+}
+
 test("parallel --list flags duplicate Claude credentials", async () => {
   await withSandbox(async (env) => {
     for (const profile of ["account1", "account2"]) {
@@ -417,6 +421,191 @@ test("parallel --run isolates live Claude sessions and syncs changed login crede
     );
     assert.equal(await fsp.readFile(path.join(accountDir, ".credentials.json"), "utf8"), newCredentials);
     assert.equal(await fsp.readFile(path.join(accountDir, ".claude.json"), "utf8"), newClaudeState);
+    if (process.platform !== "win32") {
+      const credentialsStat = await fsp.stat(path.join(accountDir, ".credentials.json"));
+      const claudeStateStat = await fsp.stat(path.join(accountDir, ".claude.json"));
+      assert.equal(credentialsStat.mode & 0o777, 0o600);
+      assert.equal(claudeStateStat.mode & 0o777, 0o600);
+    }
+  });
+});
+
+test("parallel --run preserves session auth when sync lock is busy", async () => {
+  await withSandbox(async (env) => {
+    const added = runCli(["parallel", "--add", "account2", "--json"], env);
+    assert.equal(added.status, 0, added.stderr);
+
+    const accountsDir = path.join(env.HOME as string, ".claude-accounts");
+    const accountDir = path.join(accountsDir, "account2");
+    const oldCredentials = JSON.stringify({ claudeAiOauth: { accessToken: "old-access-token" } });
+    const oldClaudeState = JSON.stringify({ oauthAccount: { accountUuid: "old-claude-account" } });
+    const newCredentials = JSON.stringify({ claudeAiOauth: { accessToken: "new-access-token" } });
+    const newClaudeState = JSON.stringify({ oauthAccount: { accountUuid: "new-claude-account" } });
+    await fsp.writeFile(path.join(accountDir, ".credentials.json"), oldCredentials);
+    await fsp.writeFile(path.join(accountDir, ".claude.json"), oldClaudeState);
+
+    const busyLock = lockDirForProfile(env.HOME as string, "account2");
+    await fsp.mkdir(busyLock, { recursive: true });
+
+    const fakeBin = path.join(env.HOME as string, "bin");
+    await fsp.mkdir(fakeBin, { recursive: true });
+    const seenConfigDir = path.join(env.HOME as string, "seen-config-dir.txt");
+    const fakeClaude = path.join(fakeBin, "claude");
+    await fsp.writeFile(
+      fakeClaude,
+      [
+        "#!/bin/sh",
+        "set -eu",
+        "printf '%s' \"$CLAUDE_CONFIG_DIR\" > \"$SEEN_CONFIG_DIR\"",
+        `printf '%s' '${newCredentials}' > "$CLAUDE_CONFIG_DIR/.credentials.json"`,
+        `printf '%s' '${newClaudeState}' > "$CLAUDE_CONFIG_DIR/.claude.json"`,
+      ].join("\n") + "\n",
+    );
+    await fsp.chmod(fakeClaude, 0o755);
+
+    const run = runCli(
+      ["parallel", "--run", "account2", "--", "--probe-arg"],
+      {
+        ...env,
+        AUTHMUX_PARALLEL_SYNC_LOCK_WAIT_MS: "0",
+        AUTHMUX_SKIP_CUE_LAUNCH: "1",
+        PATH: `${fakeBin}${path.delimiter}${env.PATH ?? ""}`,
+        SEEN_CONFIG_DIR: seenConfigDir,
+      },
+    );
+    assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stderr, /sync lock is held by another process/);
+
+    const seen = await fsp.readFile(seenConfigDir, "utf8");
+    assert.equal(await fsp.readFile(path.join(accountDir, ".credentials.json"), "utf8"), oldCredentials);
+    assert.equal(await fsp.readFile(path.join(seen, ".credentials.json"), "utf8"), newCredentials);
+  });
+});
+
+test("parallel --run preserves session auth when another session already changed the profile", async () => {
+  await withSandbox(async (env) => {
+    const added = runCli(["parallel", "--add", "account2", "--json"], env);
+    assert.equal(added.status, 0, added.stderr);
+
+    const accountsDir = path.join(env.HOME as string, ".claude-accounts");
+    const accountDir = path.join(accountsDir, "account2");
+    const oldCredentials = JSON.stringify({ claudeAiOauth: { accessToken: "old-access-token" } });
+    const oldClaudeState = JSON.stringify({ oauthAccount: { accountUuid: "old-claude-account" } });
+    const sessionCredentials = JSON.stringify({ claudeAiOauth: { accessToken: "session-access-token" } });
+    const sessionClaudeState = JSON.stringify({ oauthAccount: { accountUuid: "session-claude-account" } });
+    const otherCredentials = JSON.stringify({ claudeAiOauth: { accessToken: "other-access-token" } });
+    const otherClaudeState = JSON.stringify({ oauthAccount: { accountUuid: "other-claude-account" } });
+    await fsp.writeFile(path.join(accountDir, ".credentials.json"), oldCredentials);
+    await fsp.writeFile(path.join(accountDir, ".claude.json"), oldClaudeState);
+
+    const fakeBin = path.join(env.HOME as string, "bin");
+    await fsp.mkdir(fakeBin, { recursive: true });
+    const seenConfigDir = path.join(env.HOME as string, "seen-config-dir.txt");
+    const fakeClaude = path.join(fakeBin, "claude");
+    await fsp.writeFile(
+      fakeClaude,
+      [
+        "#!/bin/sh",
+        "set -eu",
+        "printf '%s' \"$CLAUDE_CONFIG_DIR\" > \"$SEEN_CONFIG_DIR\"",
+        `printf '%s' '${otherCredentials}' > "$CANONICAL_DIR/.credentials.json"`,
+        `printf '%s' '${otherClaudeState}' > "$CANONICAL_DIR/.claude.json"`,
+        `printf '%s' '${sessionCredentials}' > "$CLAUDE_CONFIG_DIR/.credentials.json"`,
+        `printf '%s' '${sessionClaudeState}' > "$CLAUDE_CONFIG_DIR/.claude.json"`,
+      ].join("\n") + "\n",
+    );
+    await fsp.chmod(fakeClaude, 0o755);
+
+    const run = runCli(
+      ["parallel", "--run", "account2", "--", "--probe-arg"],
+      {
+        ...env,
+        AUTHMUX_SKIP_CUE_LAUNCH: "1",
+        CANONICAL_DIR: accountDir,
+        PATH: `${fakeBin}${path.delimiter}${env.PATH ?? ""}`,
+        SEEN_CONFIG_DIR: seenConfigDir,
+      },
+    );
+    assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stderr, /canonical profile changed in another session/);
+
+    const seen = await fsp.readFile(seenConfigDir, "utf8");
+    assert.equal(await fsp.readFile(path.join(accountDir, ".credentials.json"), "utf8"), otherCredentials);
+    assert.equal(await fsp.readFile(path.join(seen, ".credentials.json"), "utf8"), sessionCredentials);
+  });
+});
+
+test("parallel --sessions lists and --clean-sessions removes stale inactive sessions", async () => {
+  await withSandbox(async (env) => {
+    const added = runCli(["parallel", "--add", "account2", "--json"], env);
+    assert.equal(added.status, 0, added.stderr);
+
+    const sessionDir = path.join(
+      env.HOME as string,
+      ".claude-accounts-sessions",
+      "account2",
+      "20200101T000000000Z-999999",
+    );
+    await fsp.mkdir(sessionDir, { recursive: true });
+    await fsp.writeFile(
+      path.join(sessionDir, ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "stale-token" } }),
+    );
+    await fsp.writeFile(
+      path.join(sessionDir, ".claude.json"),
+      JSON.stringify({ oauthAccount: { accountUuid: "stale-uuid" } }),
+    );
+    const staleTime = new Date("2020-01-01T00:00:00Z");
+    await fsp.utimes(sessionDir, staleTime, staleTime);
+
+    const listed = runCli(["parallel", "--sessions", "--json"], env);
+    assert.equal(listed.status, 0, listed.stderr);
+    const parsedList = JSON.parse(listed.stdout.trim()) as {
+      ok: true;
+      data: { sessions: Array<{ profile: string; active: boolean; credentialsPresent: boolean; claudeAccountUuid?: string }> };
+    };
+    assert.equal(parsedList.data.sessions.length, 1);
+    assert.equal(parsedList.data.sessions[0].profile, "account2");
+    assert.equal(parsedList.data.sessions[0].active, false);
+    assert.equal(parsedList.data.sessions[0].credentialsPresent, true);
+    assert.equal(parsedList.data.sessions[0].claudeAccountUuid, "stale-uuid");
+
+    const cleaned = runCli(
+      ["parallel", "--clean-sessions", "--json"],
+      {
+        ...env,
+        AUTHMUX_PARALLEL_STALE_SESSION_MS: "0",
+      },
+    );
+    assert.equal(cleaned.status, 0, cleaned.stderr);
+    const parsedClean = JSON.parse(cleaned.stdout.trim()) as {
+      ok: true;
+      data: { removed: unknown[]; kept: unknown[] };
+    };
+    assert.equal(parsedClean.data.removed.length, 1);
+    assert.equal(parsedClean.data.kept.length, 0);
+    await assert.rejects(fsp.stat(sessionDir), /ENOENT/);
+  });
+});
+
+test("parallel --doctor reports installed session-isolated fish wrappers", async () => {
+  await withSandbox(async (env) => {
+    const added = runCli(["parallel", "--add", "account2", "--json"], env);
+    assert.equal(added.status, 0, added.stderr);
+    const installed = runCli(["parallel", "--install", "--shell", "fish", "--json"], env);
+    assert.equal(installed.status, 0, installed.stderr);
+
+    const doctor = runCli(["parallel", "--doctor", "--shell", "fish", "--json"], env);
+    assert.equal(doctor.status, 0, doctor.stderr);
+    const parsed = JSON.parse(doctor.stdout.trim()) as {
+      ok: true;
+      data: { checks: Array<{ name: string; status: string; message: string }> };
+    };
+    const wrapper = parsed.data.checks.find((check) => check.name === "wrapper:account2");
+    const parallelRun = parsed.data.checks.find((check) => check.name === "parallel-run");
+    assert.equal(wrapper?.status, "ok");
+    assert.match(wrapper?.message ?? "", /session-isolated runner/);
+    assert.equal(parallelRun?.status, "ok");
   });
 });
 

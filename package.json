@@ -11,6 +11,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "postbuild": "node scripts/postbuild-parallel-install.cjs",
     "postinstall": "node scripts/postinstall-login-hook.cjs",
     "prepublishOnly": "npm run build",
     "test": "npm run build && node scripts/run-tests.cjs"
@@ -20,6 +21,7 @@
   },
   "files": [
     "dist",
+    "scripts/postbuild-parallel-install.cjs",
     "scripts/postinstall-login-hook.cjs",
     "README.md",
     "LICENSE"

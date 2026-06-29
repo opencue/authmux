@@ -17,10 +17,14 @@ import {
 const CLAUDE_PARALLEL_DIR = path.join(os.homedir(), ".claude-accounts");
 const CLAUDE_PARALLEL_BACKUP_DIR = path.join(os.homedir(), ".claude-accounts-backups");
 const CLAUDE_PARALLEL_SESSION_DIR = path.join(os.homedir(), ".claude-accounts-sessions");
+const CLAUDE_PARALLEL_LOCK_DIR = path.join(os.homedir(), ".claude-accounts-locks");
 const SKILL_PROFILE_FILE = ".authmux-skill-profile";
 const CUE_PROFILE_FILE = ".authmux-cue-profile";
 const DEFAULT_CUE_PROFILE = "core";
 const SESSION_SYNC_INTERVAL_MS = 1_000;
+const DEFAULT_STALE_SESSION_MS = 24 * 60 * 60 * 1_000;
+const DEFAULT_FINAL_LOCK_WAIT_MS = 5_000;
+const LOCK_STALE_MS = 30_000;
 type ShellName = "bash" | "zsh" | "fish";
 type LoginProfileOptions = {
   fresh: boolean;
@@ -40,6 +44,30 @@ type AuthIdentity = {
 type LaunchCommand = {
   command: string;
   args: string[];
+};
+
+type SyncStatus = "synced" | "unchanged" | "conflict" | "locked";
+
+type SyncResult = {
+  status: SyncStatus;
+  reason?: string;
+};
+
+type ParallelSessionEntry = {
+  profile: string;
+  dir: string;
+  createdAt: string;
+  ageMs: number;
+  pid?: number;
+  active: boolean;
+  credentialsPresent: boolean;
+  claudeAccountUuid?: string;
+};
+
+type ParallelDoctorCheck = {
+  name: string;
+  status: "ok" | "warn" | "error";
+  message: string;
 };
 
 interface ParallelProfileEntry {
@@ -172,13 +200,84 @@ function restoreProfileAuthBackup(backup: AuthBackup | undefined): void {
   }
 }
 
+function numericEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function lockNameForProfile(name: string): string {
+  return `${Buffer.from(name).toString("base64url")}.sync.lock`;
+}
+
+function lockDirForProfile(name: string): string {
+  return path.join(CLAUDE_PARALLEL_LOCK_DIR, lockNameForProfile(name));
+}
+
+function acquireProfileSyncLock(name: string, waitMs: number): string | undefined {
+  const lockDir = lockDirForProfile(name);
+  const deadline = Date.now() + waitMs;
+
+  fs.mkdirSync(CLAUDE_PARALLEL_LOCK_DIR, { recursive: true });
+  while (true) {
+    try {
+      fs.mkdirSync(lockDir);
+      fs.writeFileSync(
+        path.join(lockDir, "owner.json"),
+        `${JSON.stringify({
+          profile: name,
+          pid: process.pid,
+          createdAt: new Date().toISOString(),
+        })}\n`,
+      );
+      return lockDir;
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code !== "EEXIST") throw error;
+
+      const stat = fs.statSync(lockDir, { throwIfNoEntry: false });
+      if (!stat || Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+        fs.rmSync(lockDir, { recursive: true, force: true });
+        continue;
+      }
+
+      if (Date.now() >= deadline) {
+        return undefined;
+      }
+      sleepSync(Math.min(100, Math.max(0, deadline - Date.now())));
+    }
+  }
+}
+
+function releaseProfileSyncLock(lockDir: string | undefined): void {
+  if (!lockDir) return;
+  fs.rmSync(lockDir, { recursive: true, force: true });
+}
+
+function atomicCopyAuthFile(source: string, destination: string): void {
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  const temp = path.join(
+    path.dirname(destination),
+    `.${path.basename(destination)}.${process.pid}.${Date.now()}.tmp`,
+  );
+  fs.copyFileSync(source, temp);
+  fs.chmodSync(temp, 0o600);
+  fs.renameSync(temp, destination);
+}
+
 function copyAuthFiles(fromDir: string, toDir: string): void {
   fs.mkdirSync(toDir, { recursive: true });
   for (const file of [".credentials.json", ".claude.json"]) {
     const source = path.join(fromDir, file);
     const destination = path.join(toDir, file);
     if (fs.existsSync(source)) {
-      fs.copyFileSync(source, destination);
+      atomicCopyAuthFile(source, destination);
     } else {
       fs.rmSync(destination, { force: true });
     }
@@ -260,6 +359,20 @@ function readAuthIdentity(dir: string): AuthIdentity {
   };
 }
 
+function hasAuthIdentity(identity: AuthIdentity): boolean {
+  return Boolean(identity.claudeAccountUuid || identity.credentialsHash);
+}
+
+function authIdentitiesEqual(left: AuthIdentity, right: AuthIdentity): boolean {
+  if (left.claudeAccountUuid && right.claudeAccountUuid) {
+    return left.claudeAccountUuid === right.claudeAccountUuid;
+  }
+  if (left.credentialsHash && right.credentialsHash) {
+    return left.credentialsHash === right.credentialsHash;
+  }
+  return false;
+}
+
 function authFileHashes(dir: string): Map<string, string | undefined> {
   return new Map(
     [".credentials.json", ".claude.json"].map((file) => [
@@ -279,34 +392,112 @@ function authHashesChanged(
   return false;
 }
 
-function shouldSyncSessionAuth(profileDir: string, sessionDir: string, initialIdentity: AuthIdentity): boolean {
+function isProcessActive(pid: number | undefined): boolean {
+  if (!pid || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sessionPidFromDirName(name: string): number | undefined {
+  const match = name.match(/-(\d+)$/);
+  if (!match) return undefined;
+  const parsed = Number.parseInt(match[1], 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function listSessionEntries(): ParallelSessionEntry[] {
+  if (!fs.existsSync(CLAUDE_PARALLEL_SESSION_DIR)) return [];
+  const now = Date.now();
+  const entries: ParallelSessionEntry[] = [];
+
+  for (const profileEntry of fs.readdirSync(CLAUDE_PARALLEL_SESSION_DIR, { withFileTypes: true })) {
+    if (!profileEntry.isDirectory()) continue;
+    const profileDir = path.join(CLAUDE_PARALLEL_SESSION_DIR, profileEntry.name);
+    for (const sessionEntry of fs.readdirSync(profileDir, { withFileTypes: true })) {
+      if (!sessionEntry.isDirectory()) continue;
+      const sessionDir = path.join(profileDir, sessionEntry.name);
+      const stat = fs.statSync(sessionDir, { throwIfNoEntry: false });
+      if (!stat) continue;
+      const credentialsStat = statFileIfPresent(credentialsPathForDir(sessionDir));
+      const claudeAccount = readClaudeAccountUuidFromDir(sessionDir, credentialsStat?.mtimeMs);
+      const pid = sessionPidFromDirName(sessionEntry.name);
+      entries.push({
+        profile: profileEntry.name,
+        dir: sessionDir,
+        createdAt: new Date(stat.mtimeMs).toISOString(),
+        ageMs: Math.max(0, now - stat.mtimeMs),
+        pid,
+        active: isProcessActive(pid),
+        credentialsPresent: Boolean(credentialsStat),
+        claudeAccountUuid: claudeAccount.uuid,
+      });
+    }
+  }
+
+  return entries.sort((a, b) => a.profile.localeCompare(b.profile) || a.createdAt.localeCompare(b.createdAt));
+}
+
+function cleanupStaleSessions(maxAgeMs = numericEnv("AUTHMUX_PARALLEL_STALE_SESSION_MS", DEFAULT_STALE_SESSION_MS)): {
+  removed: ParallelSessionEntry[];
+  kept: ParallelSessionEntry[];
+} {
+  const removed: ParallelSessionEntry[] = [];
+  const kept: ParallelSessionEntry[] = [];
+
+  for (const entry of listSessionEntries()) {
+    if (!entry.active && entry.ageMs >= maxAgeMs) {
+      fs.rmSync(entry.dir, { recursive: true, force: true });
+      removed.push(entry);
+    } else {
+      kept.push(entry);
+    }
+  }
+
+  return { removed, kept };
+}
+
+function shouldSyncSessionAuth(profileDir: string, sessionDir: string, initialIdentity: AuthIdentity): SyncResult {
   const sessionIdentity = readAuthIdentity(sessionDir);
   const profileIdentity = readAuthIdentity(profileDir);
 
   if (
-    sessionIdentity.claudeAccountUuid &&
-    initialIdentity.claudeAccountUuid &&
-    sessionIdentity.claudeAccountUuid !== initialIdentity.claudeAccountUuid
+    hasAuthIdentity(profileIdentity) &&
+    !authIdentitiesEqual(profileIdentity, initialIdentity) &&
+    !authIdentitiesEqual(profileIdentity, sessionIdentity)
   ) {
-    return true;
+    return {
+      status: "conflict",
+      reason: "canonical profile changed in another session",
+    };
   }
 
-  if (!profileIdentity.claudeAccountUuid || !initialIdentity.claudeAccountUuid) {
-    return true;
-  }
-
-  return (
-    profileIdentity.claudeAccountUuid === initialIdentity.claudeAccountUuid ||
-    profileIdentity.claudeAccountUuid === sessionIdentity.claudeAccountUuid
-  );
+  return { status: "synced" };
 }
 
-function syncSessionAuthToProfile(profileDir: string, sessionDir: string, initialIdentity: AuthIdentity): boolean {
-  if (!shouldSyncSessionAuth(profileDir, sessionDir, initialIdentity)) {
-    return false;
+function syncSessionAuthToProfile(
+  name: string,
+  profileDir: string,
+  sessionDir: string,
+  initialIdentity: AuthIdentity,
+  options: { waitMs: number },
+): SyncResult {
+  const lockDir = acquireProfileSyncLock(name, options.waitMs);
+  if (!lockDir) {
+    return { status: "locked", reason: "sync lock is held by another process" };
   }
-  copyAuthFiles(sessionDir, profileDir);
-  return true;
+
+  try {
+    const decision = shouldSyncSessionAuth(profileDir, sessionDir, initialIdentity);
+    if (decision.status !== "synced") return decision;
+    copyAuthFiles(sessionDir, profileDir);
+    return { status: "synced" };
+  } finally {
+    releaseProfileSyncLock(lockDir);
+  }
 }
 
 function duplicateOwner<T extends string | undefined>(
@@ -359,6 +550,9 @@ export default class ClaudeParallel extends Command {
     remove: Flags.string({ description: "Remove a profile" }),
     aliases: Flags.boolean({ description: "Print shell aliases for all profiles" }),
     install: Flags.boolean({ description: "Install aliases into shell rc file" }),
+    sessions: Flags.boolean({ description: "List Claude parallel session copies" }),
+    "clean-sessions": Flags.boolean({ description: "Remove stale inactive Claude parallel session copies" }),
+    doctor: Flags.boolean({ description: "Check Claude parallel wrapper and profile health" }),
     list: Flags.boolean({ char: "l", description: "List profiles" }),
     "skill-profile": Flags.string({ description: "Soul skill profile for this Claude profile" }),
     "cue-profile": Flags.string({ description: "Cue profile used by generated claude-<name> aliases" }),
@@ -380,6 +574,9 @@ export default class ClaudeParallel extends Command {
     "agent-auth parallel --login work",
     "agent-auth parallel --login work --fresh --require-distinct",
     "agent-auth parallel --run work -- --model opus",
+    "agent-auth parallel --sessions",
+    "agent-auth parallel --clean-sessions",
+    "agent-auth parallel --doctor",
     "agent-auth parallel --list",
     "agent-auth parallel --aliases",
     "agent-auth parallel --install",
@@ -410,6 +607,12 @@ export default class ClaudeParallel extends Command {
       this.installAliases(shell);
     } else if (flags.aliases) {
       this.printAliases(shell);
+    } else if (flags.sessions) {
+      this.listSessions();
+    } else if (flags["clean-sessions"]) {
+      this.cleanSessions();
+    } else if (flags.doctor) {
+      this.doctor(shell);
     } else {
       this.listProfiles();
     }
@@ -601,6 +804,178 @@ export default class ClaudeParallel extends Command {
     }
   }
 
+  private listSessions(): void {
+    const sessions = listSessionEntries();
+    if (this.jsonMode) {
+      writeJsonEnvelope(jsonSuccess({
+        action: "sessions" as const,
+        sessions,
+      }));
+      return;
+    }
+
+    if (!sessions.length) {
+      this.log("No Claude parallel session copies found.");
+      return;
+    }
+
+    this.log("Claude parallel session copies:\n");
+    for (const session of sessions) {
+      const pidSuffix = session.pid ? ` pid=${session.pid}` : "";
+      const uuidSuffix = session.claudeAccountUuid ? ` claudeAccount=${session.claudeAccountUuid}` : "";
+      this.log(
+        `  ${session.profile}  ${session.active ? "active" : "inactive"}${pidSuffix}` +
+          ` ageMs=${session.ageMs} credentials=${session.credentialsPresent ? "present" : "missing"}` +
+          `${uuidSuffix} dir=${session.dir}`,
+      );
+    }
+  }
+
+  private cleanSessions(): void {
+    const maxAgeMs = numericEnv("AUTHMUX_PARALLEL_STALE_SESSION_MS", DEFAULT_STALE_SESSION_MS);
+    const result = cleanupStaleSessions(maxAgeMs);
+    if (this.jsonMode) {
+      writeJsonEnvelope(jsonSuccess({
+        action: "clean-sessions" as const,
+        maxAgeMs,
+        removed: result.removed,
+        kept: result.kept,
+      }));
+      return;
+    }
+
+    this.log(`Removed ${result.removed.length} stale Claude parallel session copy/copies.`);
+    if (result.kept.length) {
+      this.log(`Kept ${result.kept.length} active or fresh session copy/copies.`);
+    }
+  }
+
+  private doctor(shell: ShellName): void {
+    const checks = this.buildDoctorChecks(shell);
+    if (this.jsonMode) {
+      writeJsonEnvelope(jsonSuccess({
+        action: "doctor" as const,
+        shell,
+        checks,
+      }));
+      return;
+    }
+
+    for (const check of checks) {
+      this.log(`${check.status.toUpperCase()} ${check.name}: ${check.message}`);
+    }
+  }
+
+  private buildDoctorChecks(shell: ShellName): ParallelDoctorCheck[] {
+    const profiles = getProfiles();
+    const entries = buildProfileEntries(profiles);
+    const sessions = listSessionEntries();
+    const staleSessions = sessions.filter((session) => !session.active && session.ageMs >= DEFAULT_STALE_SESSION_MS);
+    const checks: ParallelDoctorCheck[] = [
+      {
+        name: "parallel-run",
+        status: "ok",
+        message: "`authmux parallel --run` is available.",
+      },
+      {
+        name: "profiles",
+        status: profiles.length ? "ok" : "warn",
+        message: profiles.length
+          ? `${profiles.length} Claude parallel profile(s) configured.`
+          : "No Claude parallel profiles configured.",
+      },
+      {
+        name: "claude-cli",
+        status: commandExists("claude") ? "ok" : "warn",
+        message: commandExists("claude")
+          ? "`claude` is available in PATH."
+          : "`claude` was not found in PATH; profile launch will fail until Claude Code is installed.",
+      },
+      {
+        name: "cue-cli",
+        status: commandExists("cue") ? "ok" : "warn",
+        message: commandExists("cue")
+          ? "`cue` is available for profile launches."
+          : "`cue` was not found; wrappers will fall back to direct `claude` launch.",
+      },
+      {
+        name: "sessions",
+        status: staleSessions.length ? "warn" : "ok",
+        message: staleSessions.length
+          ? `${staleSessions.length} stale inactive session copy/copies can be removed with \`authmux parallel --clean-sessions\`.`
+          : `${sessions.length} session copy/copies found; none are stale.`,
+      },
+    ];
+
+    for (const entry of entries) {
+      checks.push({
+        name: `credentials:${entry.name}`,
+        status: entry.credentialsPresent ? "ok" : "warn",
+        message: entry.credentialsPresent
+          ? `Credentials present for "${entry.name}".`
+          : `Credentials missing for "${entry.name}"; run \`claude-${entry.name}\` or \`authmux parallel --login ${entry.name}\`.`,
+      });
+
+      if (entry.credentialsDuplicateOf || entry.claudeAccountDuplicateOf) {
+        const other = entry.credentialsDuplicateOf ?? entry.claudeAccountDuplicateOf;
+        checks.push({
+          name: `duplicate:${entry.name}`,
+          status: "warn",
+          message: `"${entry.name}" shares Claude auth with "${other}".`,
+        });
+      }
+    }
+
+    checks.push(...this.wrapperDoctorChecks(shell, profiles));
+    return checks;
+  }
+
+  private wrapperDoctorChecks(shell: ShellName, profiles: string[]): ParallelDoctorCheck[] {
+    if (!profiles.length) return [];
+
+    if (shell === "fish") {
+      return profiles.map((profile): ParallelDoctorCheck => {
+        const file = path.join(fishFunctionsDir(), `claude-${profile}.fish`);
+        if (!fs.existsSync(file)) {
+          return {
+            name: `wrapper:${profile}`,
+            status: "warn",
+            message: `Fish function ${file} is not installed.`,
+          };
+        }
+
+        const body = fs.readFileSync(file, "utf8");
+        const ok = body.includes("authmux parallel --run");
+        return {
+          name: `wrapper:${profile}`,
+          status: ok ? "ok" : "error",
+          message: ok
+            ? `Fish function for "${profile}" uses session-isolated runner.`
+            : `Fish function for "${profile}" is stale; run \`authmux parallel --install --shell fish\`.`,
+        };
+      });
+    }
+
+    const rc = shellRcPath(shell);
+    if (!fs.existsSync(rc)) {
+      return [{
+        name: "wrapper",
+        status: "warn",
+        message: `${rc} does not exist.`,
+      }];
+    }
+
+    const body = fs.readFileSync(rc, "utf8");
+    const ok = body.includes("authmux parallel --run");
+    return [{
+      name: "wrapper",
+      status: ok ? "ok" : "error",
+      message: ok
+        ? `${rc} uses session-isolated runner.`
+        : `${rc} has stale Claude parallel aliases; run \`authmux parallel --install --shell ${shell}\`.`,
+    }];
+  }
+
   private resolveLaunchCommand(cueProfile: string, args: string[]): LaunchCommand {
     if (commandExists("cue") && !process.env.AUTHMUX_SKIP_CUE_LAUNCH) {
       if (cueProfile === "pick") {
@@ -634,18 +1009,39 @@ export default class ClaudeParallel extends Command {
       this.error(`Profile "${name}" not found.`);
     }
 
+    cleanupStaleSessions();
     const sessionDir = createProfileSessionDir(name);
     copyProfileToSession(profileDir, sessionDir);
     const initialIdentity = readAuthIdentity(sessionDir);
     let lastHashes = authFileHashes(sessionDir);
+    let preserveSessionDir = false;
+    let warnedSyncProblem = false;
     const cueProfile = options.cueProfile ?? readCueProfile(name) ?? DEFAULT_CUE_PROFILE;
     const launch = this.resolveLaunchCommand(cueProfile, options.args);
 
-    const syncIfChanged = (): void => {
+    const warnSyncProblem = (result: SyncResult): void => {
+      if (result.status !== "conflict" && result.status !== "locked") return;
+      preserveSessionDir = true;
+      if (warnedSyncProblem) return;
+      warnedSyncProblem = true;
+      this.warn(
+        `Claude auth changes for "${name}" were not copied back because ${result.reason ?? "sync failed"}. ` +
+          `Kept this session copy at ${sessionDir} for recovery.`,
+      );
+    };
+
+    const syncIfChanged = (waitMs: number): SyncResult => {
       const currentHashes = authFileHashes(sessionDir);
-      if (!authHashesChanged(lastHashes, currentHashes)) return;
-      syncSessionAuthToProfile(profileDir, sessionDir, initialIdentity);
-      lastHashes = currentHashes;
+      if (!authHashesChanged(lastHashes, currentHashes)) {
+        return { status: "unchanged" };
+      }
+      const result = syncSessionAuthToProfile(name, profileDir, sessionDir, initialIdentity, { waitMs });
+      if (result.status === "synced") {
+        lastHashes = currentHashes;
+        return result;
+      }
+      warnSyncProblem(result);
+      return result;
     };
 
     let interval: NodeJS.Timeout | undefined;
@@ -658,13 +1054,13 @@ export default class ClaudeParallel extends Command {
         },
       });
 
-      interval = setInterval(syncIfChanged, SESSION_SYNC_INTERVAL_MS);
+      interval = setInterval(() => syncIfChanged(0), SESSION_SYNC_INTERVAL_MS);
       const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
         child.on("error", reject);
         child.on("close", (code, signal) => resolve({ code, signal }));
       });
 
-      syncIfChanged();
+      syncIfChanged(numericEnv("AUTHMUX_PARALLEL_SYNC_LOCK_WAIT_MS", DEFAULT_FINAL_LOCK_WAIT_MS));
 
       if (result.signal) {
         this.error(`${launch.command} was terminated by signal ${result.signal}.`);
@@ -680,7 +1076,9 @@ export default class ClaudeParallel extends Command {
       throw error;
     } finally {
       if (interval) clearInterval(interval);
-      fs.rmSync(sessionDir, { recursive: true, force: true });
+      if (!preserveSessionDir) {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+      }
     }
   }
 
