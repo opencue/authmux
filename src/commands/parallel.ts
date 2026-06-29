@@ -4,7 +4,7 @@
 // with BaseCommand commands.
 
 import { Command, Flags } from "@oclif/core";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -16,9 +16,11 @@ import {
 
 const CLAUDE_PARALLEL_DIR = path.join(os.homedir(), ".claude-accounts");
 const CLAUDE_PARALLEL_BACKUP_DIR = path.join(os.homedir(), ".claude-accounts-backups");
+const CLAUDE_PARALLEL_SESSION_DIR = path.join(os.homedir(), ".claude-accounts-sessions");
 const SKILL_PROFILE_FILE = ".authmux-skill-profile";
 const CUE_PROFILE_FILE = ".authmux-cue-profile";
 const DEFAULT_CUE_PROFILE = "core";
+const SESSION_SYNC_INTERVAL_MS = 1_000;
 type ShellName = "bash" | "zsh" | "fish";
 type LoginProfileOptions = {
   fresh: boolean;
@@ -28,6 +30,16 @@ type LoginProfileOptions = {
 type AuthBackup = {
   dir: string;
   files: Array<{ name: string; source: string; backup: string }>;
+};
+
+type AuthIdentity = {
+  credentialsHash?: string;
+  claudeAccountUuid?: string;
+};
+
+type LaunchCommand = {
+  command: string;
+  args: string[];
 };
 
 interface ParallelProfileEntry {
@@ -102,12 +114,24 @@ function writeCueProfile(name: string, cueProfile: string): void {
   fs.writeFileSync(file, `${cueProfile.trim()}\n`);
 }
 
+function profileDirFor(name: string): string {
+  return path.join(CLAUDE_PARALLEL_DIR, name);
+}
+
+function credentialsPathForDir(dir: string): string {
+  return path.join(dir, ".credentials.json");
+}
+
 function credentialsPathForProfile(name: string): string {
-  return path.join(CLAUDE_PARALLEL_DIR, name, ".credentials.json");
+  return credentialsPathForDir(profileDirFor(name));
+}
+
+function claudeStatePathForDir(dir: string): string {
+  return path.join(dir, ".claude.json");
 }
 
 function claudeStatePathForProfile(name: string): string {
-  return path.join(CLAUDE_PARALLEL_DIR, name, ".claude.json");
+  return claudeStatePathForDir(profileDirFor(name));
 }
 
 function authFilePathsForProfile(name: string): Array<{ name: string; source: string }> {
@@ -148,6 +172,40 @@ function restoreProfileAuthBackup(backup: AuthBackup | undefined): void {
   }
 }
 
+function copyAuthFiles(fromDir: string, toDir: string): void {
+  fs.mkdirSync(toDir, { recursive: true });
+  for (const file of [".credentials.json", ".claude.json"]) {
+    const source = path.join(fromDir, file);
+    const destination = path.join(toDir, file);
+    if (fs.existsSync(source)) {
+      fs.copyFileSync(source, destination);
+    } else {
+      fs.rmSync(destination, { force: true });
+    }
+  }
+}
+
+function commandExists(command: string): boolean {
+  const pathEntries = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
+  const extensions = process.platform === "win32"
+    ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";")
+    : [""];
+
+  return pathEntries.some((entry) =>
+    extensions.some((extension) => fs.existsSync(path.join(entry, `${command}${extension}`))),
+  );
+}
+
+function createProfileSessionDir(name: string): string {
+  const sessionDir = path.join(CLAUDE_PARALLEL_SESSION_DIR, name, `${backupTimestamp()}-${process.pid}`);
+  fs.mkdirSync(path.dirname(sessionDir), { recursive: true });
+  return sessionDir;
+}
+
+function copyProfileToSession(profileDir: string, sessionDir: string): void {
+  fs.cpSync(profileDir, sessionDir, { recursive: true });
+}
+
 function hashFileIfPresent(file: string): string | undefined {
   if (!fs.existsSync(file)) return undefined;
   const hash = createHash("sha256");
@@ -159,11 +217,11 @@ function statFileIfPresent(file: string): fs.Stats | undefined {
   return fs.statSync(file, { throwIfNoEntry: false }) ?? undefined;
 }
 
-function readClaudeAccountUuid(name: string, credentialsMtimeMs?: number): {
+function readClaudeAccountUuidFromDir(dir: string, credentialsMtimeMs?: number): {
   uuid?: string;
   stale: boolean;
 } {
-  const file = claudeStatePathForProfile(name);
+  const file = claudeStatePathForDir(dir);
   const stateStat = statFileIfPresent(file);
   if (!stateStat) return { stale: false };
 
@@ -183,6 +241,72 @@ function readClaudeAccountUuid(name: string, credentialsMtimeMs?: number): {
   } catch {
     return { stale: false };
   }
+}
+
+function readClaudeAccountUuid(name: string, credentialsMtimeMs?: number): {
+  uuid?: string;
+  stale: boolean;
+} {
+  return readClaudeAccountUuidFromDir(profileDirFor(name), credentialsMtimeMs);
+}
+
+function readAuthIdentity(dir: string): AuthIdentity {
+  const credentialsPath = credentialsPathForDir(dir);
+  const credentialsStat = statFileIfPresent(credentialsPath);
+  const claudeAccount = readClaudeAccountUuidFromDir(dir, credentialsStat?.mtimeMs);
+  return {
+    credentialsHash: credentialsStat ? hashFileIfPresent(credentialsPath) : undefined,
+    claudeAccountUuid: claudeAccount.uuid,
+  };
+}
+
+function authFileHashes(dir: string): Map<string, string | undefined> {
+  return new Map(
+    [".credentials.json", ".claude.json"].map((file) => [
+      file,
+      hashFileIfPresent(path.join(dir, file)),
+    ]),
+  );
+}
+
+function authHashesChanged(
+  previous: Map<string, string | undefined>,
+  current: Map<string, string | undefined>,
+): boolean {
+  for (const [file, hash] of current) {
+    if (previous.get(file) !== hash) return true;
+  }
+  return false;
+}
+
+function shouldSyncSessionAuth(profileDir: string, sessionDir: string, initialIdentity: AuthIdentity): boolean {
+  const sessionIdentity = readAuthIdentity(sessionDir);
+  const profileIdentity = readAuthIdentity(profileDir);
+
+  if (
+    sessionIdentity.claudeAccountUuid &&
+    initialIdentity.claudeAccountUuid &&
+    sessionIdentity.claudeAccountUuid !== initialIdentity.claudeAccountUuid
+  ) {
+    return true;
+  }
+
+  if (!profileIdentity.claudeAccountUuid || !initialIdentity.claudeAccountUuid) {
+    return true;
+  }
+
+  return (
+    profileIdentity.claudeAccountUuid === initialIdentity.claudeAccountUuid ||
+    profileIdentity.claudeAccountUuid === sessionIdentity.claudeAccountUuid
+  );
+}
+
+function syncSessionAuthToProfile(profileDir: string, sessionDir: string, initialIdentity: AuthIdentity): boolean {
+  if (!shouldSyncSessionAuth(profileDir, sessionDir, initialIdentity)) {
+    return false;
+  }
+  copyAuthFiles(sessionDir, profileDir);
+  return true;
 }
 
 function duplicateOwner<T extends string | undefined>(
@@ -222,10 +346,12 @@ function buildProfileEntries(profiles = getProfiles()): ParallelProfileEntry[] {
 
 export default class ClaudeParallel extends Command {
   static description = "Manage parallel Claude Code accounts via CLAUDE_CONFIG_DIR";
+  static strict = false;
 
   static flags = {
     add: Flags.string({ description: "Add a new profile name" }),
     login: Flags.string({ description: "Run Claude Code login inside a parallel profile" }),
+    run: Flags.string({ description: "Run Claude Code with a session-isolated parallel profile" }),
     fresh: Flags.boolean({ description: "Back up and remove existing Claude auth before --login" }),
     "require-distinct": Flags.boolean({
       description: "Fail --login if the result matches another Claude profile",
@@ -253,6 +379,7 @@ export default class ClaudeParallel extends Command {
     "agent-auth parallel --add personal",
     "agent-auth parallel --login work",
     "agent-auth parallel --login work --fresh --require-distinct",
+    "agent-auth parallel --run work -- --model opus",
     "agent-auth parallel --list",
     "agent-auth parallel --aliases",
     "agent-auth parallel --install",
@@ -261,7 +388,7 @@ export default class ClaudeParallel extends Command {
   private jsonMode = false;
 
   async run(): Promise<void> {
-    const { flags } = await this.parse(ClaudeParallel);
+    const { flags, argv } = await this.parse(ClaudeParallel);
     this.jsonMode = Boolean(flags.json);
     const shell = resolveShellName(flags.shell);
 
@@ -271,6 +398,11 @@ export default class ClaudeParallel extends Command {
       this.loginProfile(flags.login, {
         fresh: Boolean(flags.fresh),
         requireDistinct: Boolean(flags["require-distinct"]),
+      });
+    } else if (flags.run) {
+      await this.runProfile(flags.run, {
+        cueProfile: flags["cue-profile"],
+        args: argv as string[],
       });
     } else if (flags.remove) {
       this.removeProfile(flags.remove);
@@ -330,7 +462,7 @@ export default class ClaudeParallel extends Command {
       this.error("parallel --login is interactive and does not support --json.");
     }
 
-    const dir = path.join(CLAUDE_PARALLEL_DIR, name);
+    const dir = profileDirFor(name);
     const existed = fs.existsSync(dir);
     if (!existed) {
       fs.mkdirSync(dir, { recursive: true });
@@ -391,7 +523,7 @@ export default class ClaudeParallel extends Command {
   }
 
   private removeProfile(name: string): void {
-    const dir = path.join(CLAUDE_PARALLEL_DIR, name);
+    const dir = profileDirFor(name);
     if (!fs.existsSync(dir)) {
       this.error(`Profile "${name}" not found.`);
     }
@@ -469,6 +601,89 @@ export default class ClaudeParallel extends Command {
     }
   }
 
+  private resolveLaunchCommand(cueProfile: string, args: string[]): LaunchCommand {
+    if (commandExists("cue") && !process.env.AUTHMUX_SKIP_CUE_LAUNCH) {
+      if (cueProfile === "pick") {
+        return {
+          command: "cue",
+          args: ["launch", "claude", "--cue-pick", ...args],
+        };
+      }
+      return {
+        command: "cue",
+        args: ["launch", "claude", "--cue-profile", cueProfile, ...args],
+      };
+    }
+
+    return {
+      command: "claude",
+      args,
+    };
+  }
+
+  private async runProfile(
+    name: string,
+    options: { cueProfile?: string; args: string[] },
+  ): Promise<void> {
+    if (this.jsonMode) {
+      this.error("parallel --run is interactive and does not support --json.");
+    }
+
+    const profileDir = profileDirFor(name);
+    if (!fs.existsSync(profileDir)) {
+      this.error(`Profile "${name}" not found.`);
+    }
+
+    const sessionDir = createProfileSessionDir(name);
+    copyProfileToSession(profileDir, sessionDir);
+    const initialIdentity = readAuthIdentity(sessionDir);
+    let lastHashes = authFileHashes(sessionDir);
+    const cueProfile = options.cueProfile ?? readCueProfile(name) ?? DEFAULT_CUE_PROFILE;
+    const launch = this.resolveLaunchCommand(cueProfile, options.args);
+
+    const syncIfChanged = (): void => {
+      const currentHashes = authFileHashes(sessionDir);
+      if (!authHashesChanged(lastHashes, currentHashes)) return;
+      syncSessionAuthToProfile(profileDir, sessionDir, initialIdentity);
+      lastHashes = currentHashes;
+    };
+
+    let interval: NodeJS.Timeout | undefined;
+    try {
+      const child = spawn(launch.command, launch.args, {
+        stdio: "inherit",
+        env: {
+          ...process.env,
+          CLAUDE_CONFIG_DIR: sessionDir,
+        },
+      });
+
+      interval = setInterval(syncIfChanged, SESSION_SYNC_INTERVAL_MS);
+      const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+        child.on("error", reject);
+        child.on("close", (code, signal) => resolve({ code, signal }));
+      });
+
+      syncIfChanged();
+
+      if (result.signal) {
+        this.error(`${launch.command} was terminated by signal ${result.signal}.`);
+      }
+      if (result.code && result.code !== 0) {
+        this.exit(result.code);
+      }
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code === "ENOENT") {
+        this.error(`\`${launch.command}\` was not found in PATH.`);
+      }
+      throw error;
+    } finally {
+      if (interval) clearInterval(interval);
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+  }
+
   private generateBashAliases(): string {
     const profiles = getProfiles();
     if (!profiles.length) return "";
@@ -492,17 +707,7 @@ export default class ClaudeParallel extends Command {
       "  if [ \"$#\" -eq 0 ] && [ ! -s \"$dir/.credentials.json\" ]; then",
       "    command authmux parallel --login \"$name\" --fresh --require-distinct || return $?",
       "  fi",
-      "  if command -v cue >/dev/null 2>&1 && [ -z \"${AUTHMUX_SKIP_CUE_LAUNCH:-}\" ]; then",
-      // The sentinel `pick` means \"don't force a profile — open cue's selector\".
-      // Any other value is forced via --cue-profile (which suppresses the picker).
-      "    if [ \"$cue_profile\" = \"pick\" ]; then",
-      "      CLAUDE_CONFIG_DIR=\"$dir\" cue launch claude --cue-pick \"$@\"",
-      "    else",
-      "      CLAUDE_CONFIG_DIR=\"$dir\" cue launch claude --cue-profile \"$cue_profile\" \"$@\"",
-      "    fi",
-      "  else",
-      "    CLAUDE_CONFIG_DIR=\"$dir\" command claude \"$@\"",
-      "  fi",
+      "  command authmux parallel --run \"$name\" --cue-profile \"$cue_profile\" -- \"$@\"",
       "}",
       ...profiles.map((p) => {
         const skillProfile = readSkillProfile(p) ?? "base";
@@ -536,13 +741,7 @@ export default class ClaudeParallel extends Command {
       "        command authmux parallel --login \"$name\" --fresh --require-distinct",
       "        or return $status",
       "    end",
-      "    if command -q cue; and not set -q AUTHMUX_SKIP_CUE_LAUNCH",
-      cueProfile === "pick"
-        ? "        cue launch claude --cue-pick $argv"
-        : "        cue launch claude --cue-profile \"$cue_profile\" $argv",
-      "    else",
-      "        command claude $argv",
-      "    end",
+      "    command authmux parallel --run \"$name\" --cue-profile \"$cue_profile\" -- $argv",
       "end",
     ];
     return lines.join("\n");
