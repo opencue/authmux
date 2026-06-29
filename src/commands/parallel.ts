@@ -15,10 +15,20 @@ import {
 } from "../lib/cli/json-envelope";
 
 const CLAUDE_PARALLEL_DIR = path.join(os.homedir(), ".claude-accounts");
+const CLAUDE_PARALLEL_BACKUP_DIR = path.join(os.homedir(), ".claude-accounts-backups");
 const SKILL_PROFILE_FILE = ".authmux-skill-profile";
 const CUE_PROFILE_FILE = ".authmux-cue-profile";
 const DEFAULT_CUE_PROFILE = "core";
 type ShellName = "bash" | "zsh" | "fish";
+type LoginProfileOptions = {
+  fresh: boolean;
+  requireDistinct: boolean;
+};
+
+type AuthBackup = {
+  dir: string;
+  files: Array<{ name: string; source: string; backup: string }>;
+};
 
 interface ParallelProfileEntry {
   name: string;
@@ -99,6 +109,44 @@ function claudeStatePathForProfile(name: string): string {
   return path.join(CLAUDE_PARALLEL_DIR, name, ".claude.json");
 }
 
+function authFilePathsForProfile(name: string): Array<{ name: string; source: string }> {
+  return [
+    { name: ".credentials.json", source: credentialsPathForProfile(name) },
+    { name: ".claude.json", source: claudeStatePathForProfile(name) },
+  ];
+}
+
+function backupTimestamp(): string {
+  return new Date().toISOString().replace(/[-:]/g, "").replace(/\.(\d{3})Z$/, "$1Z");
+}
+
+function backupProfileAuthFiles(name: string, reason: string): AuthBackup | undefined {
+  const files = authFilePathsForProfile(name).filter((file) => fs.existsSync(file.source));
+  if (!files.length) return undefined;
+
+  const backupDir = path.join(CLAUDE_PARALLEL_BACKUP_DIR, `${name}-${reason}-${backupTimestamp()}`);
+  fs.mkdirSync(backupDir, { recursive: true });
+  const backup: AuthBackup = { dir: backupDir, files: [] };
+
+  for (const file of files) {
+    const backupPath = path.join(backupDir, file.name);
+    fs.renameSync(file.source, backupPath);
+    backup.files.push({ ...file, backup: backupPath });
+  }
+
+  return backup;
+}
+
+function restoreProfileAuthBackup(backup: AuthBackup | undefined): void {
+  if (!backup) return;
+
+  for (const file of backup.files) {
+    if (fs.existsSync(file.source)) continue;
+    fs.mkdirSync(path.dirname(file.source), { recursive: true });
+    fs.renameSync(file.backup, file.source);
+  }
+}
+
 function hashFileIfPresent(file: string): string | undefined {
   if (!fs.existsSync(file)) return undefined;
   const hash = createHash("sha256");
@@ -159,6 +207,10 @@ export default class ClaudeParallel extends Command {
   static flags = {
     add: Flags.string({ description: "Add a new profile name" }),
     login: Flags.string({ description: "Run Claude Code login inside a parallel profile" }),
+    fresh: Flags.boolean({ description: "Back up and remove existing Claude auth before --login" }),
+    "require-distinct": Flags.boolean({
+      description: "Fail --login if the result matches another Claude profile",
+    }),
     remove: Flags.string({ description: "Remove a profile" }),
     aliases: Flags.boolean({ description: "Print shell aliases for all profiles" }),
     install: Flags.boolean({ description: "Install aliases into shell rc file" }),
@@ -181,6 +233,7 @@ export default class ClaudeParallel extends Command {
     "agent-auth parallel --add frontend --skill-profile frontend",
     "agent-auth parallel --add personal",
     "agent-auth parallel --login work",
+    "agent-auth parallel --login work --fresh --require-distinct",
     "agent-auth parallel --list",
     "agent-auth parallel --aliases",
     "agent-auth parallel --install",
@@ -196,7 +249,10 @@ export default class ClaudeParallel extends Command {
     if (flags.add) {
       this.addProfile(flags.add, flags["skill-profile"], flags["cue-profile"]);
     } else if (flags.login) {
-      this.loginProfile(flags.login);
+      this.loginProfile(flags.login, {
+        fresh: Boolean(flags.fresh),
+        requireDistinct: Boolean(flags["require-distinct"]),
+      });
     } else if (flags.remove) {
       this.removeProfile(flags.remove);
     } else if (flags.install) {
@@ -250,7 +306,7 @@ export default class ClaudeParallel extends Command {
     this.log(`\nTo install shell aliases: agent-auth parallel --install`);
   }
 
-  private loginProfile(name: string): void {
+  private loginProfile(name: string, options: LoginProfileOptions): void {
     if (this.jsonMode) {
       this.error("parallel --login is interactive and does not support --json.");
     }
@@ -264,6 +320,11 @@ export default class ClaudeParallel extends Command {
       this.log(`  Config dir: ${dir}`);
     }
 
+    const existingBackup = options.fresh ? backupProfileAuthFiles(name, "fresh-login") : undefined;
+    if (existingBackup) {
+      this.log(`Backed up existing Claude auth for "${name}" to ${existingBackup.dir}.`);
+    }
+
     const credentialsPath = credentialsPathForProfile(name);
     const before = fs.statSync(credentialsPath, { throwIfNoEntry: false })?.mtimeMs ?? 0;
     const result = spawnSync("claude", ["login"], {
@@ -275,6 +336,7 @@ export default class ClaudeParallel extends Command {
     });
 
     if (result.error) {
+      restoreProfileAuthBackup(existingBackup);
       const err = result.error as NodeJS.ErrnoException;
       if (err.code === "ENOENT") {
         this.error("`claude` CLI was not found in PATH. Install Claude Code first, then retry.");
@@ -283,12 +345,25 @@ export default class ClaudeParallel extends Command {
     }
 
     if (result.status !== 0) {
+      restoreProfileAuthBackup(existingBackup);
       this.error(`\`claude login\` failed with exit code ${result.status ?? "unknown"}.`);
     }
 
     const after = fs.statSync(credentialsPath, { throwIfNoEntry: false });
     if (!after) {
+      restoreProfileAuthBackup(existingBackup);
       this.error(`Claude login completed but did not write ${credentialsPath}.`);
+    }
+
+    const duplicateEntry = buildProfileEntries().find((p) => p.name === name);
+    const duplicateOwner = duplicateEntry?.credentialsDuplicateOf ?? duplicateEntry?.claudeAccountDuplicateOf;
+    if (options.requireDistinct && duplicateOwner) {
+      const duplicateBackup = backupProfileAuthFiles(name, "duplicate-login");
+      this.error(
+        `Claude login for "${name}" produced the same account as "${duplicateOwner}". ` +
+          `The duplicate auth was moved to ${duplicateBackup?.dir ?? "a backup directory"}. ` +
+          "Run the login again and choose a different Anthropic account.",
+      );
     }
 
     const suffix = after.mtimeMs > before ? "refreshed" : "present";
@@ -386,9 +461,16 @@ export default class ClaudeParallel extends Command {
       "  shift 3",
       "  local dir=\"$HOME/.claude-accounts/$name\"",
       "  command authmux skills activate \"$skill_profile\" --agent claude --target \"$dir/skills\" >/dev/null 2>&1 || true",
-      "  if [ \"${1:-}\" = \"login\" ] || [ \"${1:-}\" = \"logout\" ] || [ ! -s \"$dir/.credentials.json\" ]; then",
+      "  if [ \"${1:-}\" = \"login\" ]; then",
+      "    command authmux parallel --login \"$name\" --fresh --require-distinct",
+      "    return $?",
+      "  fi",
+      "  if [ \"${1:-}\" = \"logout\" ]; then",
       "    CLAUDE_CONFIG_DIR=\"$dir\" command claude \"$@\"",
       "    return $?",
+      "  fi",
+      "  if [ \"$#\" -eq 0 ] && [ ! -s \"$dir/.credentials.json\" ]; then",
+      "    command authmux parallel --login \"$name\" --fresh --require-distinct || return $?",
       "  fi",
       "  if command -v cue >/dev/null 2>&1 && [ -z \"${AUTHMUX_SKIP_CUE_LAUNCH:-}\" ]; then",
       // The sentinel `pick` means \"don't force a profile — open cue's selector\".
@@ -423,16 +505,16 @@ export default class ClaudeParallel extends Command {
       "    command authmux skills activate \"$skill_profile\" --agent claude --target \"$dir/skills\" >/dev/null 2>&1; or true",
       "    set -lx CLAUDE_CONFIG_DIR \"$dir\"",
       "    if set -q argv[1]; and test \"$argv[1]\" = login",
-      "        command claude $argv",
+      "        command authmux parallel --login \"$name\" --fresh --require-distinct",
       "        return $status",
       "    end",
       "    if set -q argv[1]; and test \"$argv[1]\" = logout",
       "        command claude $argv",
       "        return $status",
       "    end",
-      "    if not test -s \"$dir/.credentials.json\"",
-      "        command claude $argv",
-      "        return $status",
+      "    if not set -q argv[1]; and not test -s \"$dir/.credentials.json\"",
+      "        command authmux parallel --login \"$name\" --fresh --require-distinct",
+      "        or return $status",
       "    end",
       "    if command -q cue; and not set -q AUTHMUX_SKIP_CUE_LAUNCH",
       cueProfile === "pick"

@@ -240,6 +240,62 @@ test("parallel --list flags duplicate Claude credentials", async () => {
   });
 });
 
+test("parallel --login can reject duplicate Claude accounts", async () => {
+  await withSandbox(async (env) => {
+    for (const profile of ["account1", "account2"]) {
+      const added = runCli(["parallel", "--add", profile, "--json"], env);
+      assert.equal(added.status, 0, added.stderr);
+    }
+
+    const accountsDir = path.join(env.HOME as string, ".claude-accounts");
+    const duplicateCredentials = JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "same-access-token",
+        refreshToken: "same-refresh-token",
+        expiresAt: 1782742285132,
+      },
+    });
+    const duplicateClaudeState = JSON.stringify({
+      oauthAccount: {
+        accountUuid: "same-claude-account",
+      },
+    });
+    const account1Dir = path.join(accountsDir, "account1");
+    await fsp.writeFile(path.join(account1Dir, ".credentials.json"), duplicateCredentials);
+    await fsp.writeFile(path.join(account1Dir, ".claude.json"), duplicateClaudeState);
+
+    const fakeBin = path.join(env.HOME as string, "bin");
+    await fsp.mkdir(fakeBin, { recursive: true });
+    const fakeClaude = path.join(fakeBin, "claude");
+    await fsp.writeFile(
+      fakeClaude,
+      [
+        "#!/bin/sh",
+        "set -eu",
+        "test \"${1:-}\" = login",
+        "mkdir -p \"$CLAUDE_CONFIG_DIR\"",
+        `printf '%s' '${duplicateCredentials}' > "$CLAUDE_CONFIG_DIR/.credentials.json"`,
+        `printf '%s' '${duplicateClaudeState}' > "$CLAUDE_CONFIG_DIR/.claude.json"`,
+      ].join("\n") + "\n",
+    );
+    await fsp.chmod(fakeClaude, 0o755);
+
+    const login = runCli(
+      ["parallel", "--login", "account2", "--fresh", "--require-distinct"],
+      {
+        ...env,
+        PATH: `${fakeBin}${path.delimiter}${env.PATH ?? ""}`,
+      },
+    );
+    assert.notEqual(login.status, 0);
+    assert.match(login.stderr, /same account[\s\S]*"account1"/);
+    await assert.rejects(
+      fsp.stat(path.join(accountsDir, "account2", ".credentials.json")),
+      /ENOENT/,
+    );
+  });
+});
+
 for (const tc of CASES) {
   test(`--json parity: ${tc.name}`, async () => {
     await withSandbox(async (env) => {
@@ -352,7 +408,7 @@ test("parallel aliases pass explicit cue profile per Claude account", async () =
     );
     assert.match(
       parsedAliases.data.aliases,
-      /\[ "\$\{1:-\}" = "login" \]/,
+      /authmux parallel --login "\$name" --fresh --require-distinct/,
     );
     assert.match(
       parsedAliases.data.aliases,
@@ -399,6 +455,7 @@ test("parallel install writes Fish functions with direct login refresh path", as
     const body = await fsp.readFile(functionPath, "utf8");
     assert.match(body, /set -lx CLAUDE_CONFIG_DIR "\$dir"/);
     assert.match(body, /test "\$argv\[1\]" = login/);
+    assert.match(body, /authmux parallel --login "\$name" --fresh --require-distinct/);
     assert.match(body, /not test -s "\$dir\/\.credentials\.json"/);
     assert.match(body, /cue launch claude --cue-pick \$argv/);
     assert.match(body, /command claude \$argv/);
