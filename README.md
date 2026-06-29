@@ -225,8 +225,8 @@ source ~/.bashrc  # or ~/.zshrc
 claude-work       # logs in, credentials saved to ~/.claude-accounts/work
 claude-personal   # logs in, credentials saved to ~/.claude-accounts/personal
 
-# Force a fresh OAuth login for one profile
-authmux parallel --login work
+# Force a fresh OAuth login for one profile and reject duplicate account picks
+authmux parallel --login work --fresh --require-distinct
 ```
 
 ### Quick setup (standalone script)
@@ -241,6 +241,7 @@ source ~/.bashrc
 ```sh
 authmux parallel --add <name>     # Create a new profile
 authmux parallel --login <name>   # Refresh Claude OAuth inside that profile
+authmux parallel --login <name> --fresh --require-distinct  # Reset stale Claude auth first and fail if it matches another profile
 authmux parallel --remove <name>  # Remove a profile
 authmux parallel --list           # List all profiles
 authmux parallel --aliases        # Print aliases (without installing)
@@ -249,9 +250,9 @@ authmux parallel --install        # Write aliases to shell rc file
 
 ### How it works
 
-Each profile gets its own config directory at `~/.claude-accounts/<name>`. Shell aliases/functions set `CLAUDE_CONFIG_DIR` before launching `claude`, so each instance uses isolated credentials, settings, and history. `authmux parallel --install` writes Bash/Zsh aliases or Fish autoload functions based on `$SHELL`. Login and logout commands bypass Cue and run raw Claude against the selected profile so refreshed OAuth tokens are written back to the right account directory. Run profiles in separate terminal tabs or tmux panes for true parallel usage.
+Each profile gets its own config directory at `~/.claude-accounts/<name>`. Shell aliases/functions set `CLAUDE_CONFIG_DIR` before launching `claude`, so each instance uses isolated credentials, settings, and history. `authmux parallel --install` writes Bash/Zsh aliases or Fish autoload functions based on `$SHELL`. Login and logout commands bypass Cue so refreshed OAuth tokens are written back to the right account directory. Generated login wrappers use `authmux parallel --login <name> --fresh --require-distinct`, which backs up stale Claude auth first and rejects a login that resolves to another configured profile. Run profiles in separate terminal tabs or tmux panes for true parallel usage.
 
-`authmux parallel --list` warns when two profiles contain the same Claude credentials or the same Claude OAuth account UUID. Those profiles are not independent: logging in or out of one can invalidate the other because Claude sees them as the same account session. Re-run `authmux parallel --login <name>` and choose a different Anthropic account for any profile that should have its own subscription/session.
+`authmux parallel --list` warns when two profiles contain the same Claude credentials or the same Claude OAuth account UUID. Those profiles are not independent: logging in or out of one can invalidate the other because Claude sees them as the same account session. Re-run `authmux parallel --login <name> --fresh --require-distinct` and choose a different Anthropic account for any profile that should have its own subscription/session.
 
 ### Notes
 
