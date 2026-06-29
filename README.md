@@ -251,6 +251,8 @@ authmux parallel --install        # Write aliases to shell rc file
 
 Each profile gets its own config directory at `~/.claude-accounts/<name>`. Shell aliases/functions set `CLAUDE_CONFIG_DIR` before launching `claude`, so each instance uses isolated credentials, settings, and history. `authmux parallel --install` writes Bash/Zsh aliases or Fish autoload functions based on `$SHELL`. Login and logout commands bypass Cue and run raw Claude against the selected profile so refreshed OAuth tokens are written back to the right account directory. Run profiles in separate terminal tabs or tmux panes for true parallel usage.
 
+`authmux parallel --list` warns when two profiles contain the same Claude credentials or the same Claude OAuth account UUID. Those profiles are not independent: logging in or out of one can invalidate the other because Claude sees them as the same account session. Re-run `authmux parallel --login <name>` and choose a different Anthropic account for any profile that should have its own subscription/session.
+
 ### Notes
 
 - Requires a separate Anthropic subscription (different email) per profile.

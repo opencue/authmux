@@ -5,6 +5,7 @@
 
 import { Command, Flags } from "@oclif/core";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -18,6 +19,16 @@ const SKILL_PROFILE_FILE = ".authmux-skill-profile";
 const CUE_PROFILE_FILE = ".authmux-cue-profile";
 const DEFAULT_CUE_PROFILE = "core";
 type ShellName = "bash" | "zsh" | "fish";
+
+interface ParallelProfileEntry {
+  name: string;
+  configDir: string;
+  skillProfile: string;
+  cueProfile: string;
+  credentialsPresent: boolean;
+  credentialsDuplicateOf?: string;
+  claudeAccountDuplicateOf?: string;
+}
 
 function getProfiles(): string[] {
   if (!fs.existsSync(CLAUDE_PARALLEL_DIR)) return [];
@@ -78,6 +89,68 @@ function readCueProfile(name: string): string | undefined {
 function writeCueProfile(name: string, cueProfile: string): void {
   const file = path.join(CLAUDE_PARALLEL_DIR, name, CUE_PROFILE_FILE);
   fs.writeFileSync(file, `${cueProfile.trim()}\n`);
+}
+
+function credentialsPathForProfile(name: string): string {
+  return path.join(CLAUDE_PARALLEL_DIR, name, ".credentials.json");
+}
+
+function claudeStatePathForProfile(name: string): string {
+  return path.join(CLAUDE_PARALLEL_DIR, name, ".claude.json");
+}
+
+function hashFileIfPresent(file: string): string | undefined {
+  if (!fs.existsSync(file)) return undefined;
+  const hash = createHash("sha256");
+  hash.update(fs.readFileSync(file));
+  return hash.digest("hex");
+}
+
+function readClaudeAccountUuid(name: string): string | undefined {
+  const file = claudeStatePathForProfile(name);
+  if (!fs.existsSync(file)) return undefined;
+
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as {
+      oauthAccount?: { accountUuid?: unknown };
+    };
+    const uuid = parsed.oauthAccount?.accountUuid;
+    return typeof uuid === "string" && uuid.length > 0 ? uuid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function duplicateOwner<T extends string | undefined>(
+  value: T,
+  seen: Map<string, string>,
+  profile: string,
+): string | undefined {
+  if (!value) return undefined;
+  const existing = seen.get(value);
+  if (existing) return existing;
+  seen.set(value, profile);
+  return undefined;
+}
+
+function buildProfileEntries(profiles = getProfiles()): ParallelProfileEntry[] {
+  const seenCredentialHashes = new Map<string, string>();
+  const seenClaudeAccountUuids = new Map<string, string>();
+
+  return profiles.map((p) => {
+    const credentialHash = hashFileIfPresent(credentialsPathForProfile(p));
+    const claudeAccountUuid = readClaudeAccountUuid(p);
+
+    return {
+      name: p,
+      configDir: path.join(CLAUDE_PARALLEL_DIR, p),
+      skillProfile: readSkillProfile(p) ?? "base",
+      cueProfile: readCueProfile(p) ?? readSkillProfile(p) ?? DEFAULT_CUE_PROFILE,
+      credentialsPresent: Boolean(credentialHash),
+      credentialsDuplicateOf: duplicateOwner(credentialHash, seenCredentialHashes, p),
+      claudeAccountDuplicateOf: duplicateOwner(claudeAccountUuid, seenClaudeAccountUuids, p),
+    };
+  });
 }
 
 export default class ClaudeParallel extends Command {
@@ -191,7 +264,7 @@ export default class ClaudeParallel extends Command {
       this.log(`  Config dir: ${dir}`);
     }
 
-    const credentialsPath = path.join(dir, ".credentials.json");
+    const credentialsPath = credentialsPathForProfile(name);
     const before = fs.statSync(credentialsPath, { throwIfNoEntry: false })?.mtimeMs ?? 0;
     const result = spawnSync("claude", ["login"], {
       stdio: "inherit",
@@ -220,6 +293,7 @@ export default class ClaudeParallel extends Command {
 
     const suffix = after.mtimeMs > before ? "refreshed" : "present";
     this.log(`Claude credentials ${suffix} for "${name}" at ${credentialsPath}.`);
+    this.warnIfProfileDuplicates(name);
   }
 
   private removeProfile(name: string): void {
@@ -242,12 +316,7 @@ export default class ClaudeParallel extends Command {
 
   private listProfiles(): void {
     const profiles = getProfiles();
-    const entries = profiles.map((p) => ({
-      name: p,
-      configDir: path.join(CLAUDE_PARALLEL_DIR, p),
-      skillProfile: readSkillProfile(p) ?? "base",
-      cueProfile: readCueProfile(p) ?? readSkillProfile(p) ?? DEFAULT_CUE_PROFILE,
-    }));
+    const entries = buildProfileEntries(profiles);
 
     if (this.jsonMode) {
       writeJsonEnvelope(jsonSuccess({
@@ -264,9 +333,45 @@ export default class ClaudeParallel extends Command {
     }
     this.log("Claude Code parallel profiles:\n");
     for (const p of entries) {
-      this.log(`  • ${p.name}  →  ${p.configDir}  skillProfile=${p.skillProfile} cueProfile=${p.cueProfile}`);
+      const duplicateBits = [
+        p.credentialsDuplicateOf ? `credentialsDuplicateOf=${p.credentialsDuplicateOf}` : undefined,
+        p.claudeAccountDuplicateOf ? `claudeAccountDuplicateOf=${p.claudeAccountDuplicateOf}` : undefined,
+      ].filter(Boolean);
+      const duplicateSuffix = duplicateBits.length ? ` ${duplicateBits.join(" ")}` : "";
+      this.log(
+        `  • ${p.name}  →  ${p.configDir}  skillProfile=${p.skillProfile} cueProfile=${p.cueProfile}` +
+          ` credentials=${p.credentialsPresent ? "present" : "missing"}${duplicateSuffix}`,
+      );
     }
+    this.warnForDuplicateEntries(entries);
     this.log(`\nRun any profile: claude-<name> (after installing aliases)`);
+  }
+
+  private warnIfProfileDuplicates(name: string): void {
+    const entry = buildProfileEntries().find((p) => p.name === name);
+    if (!entry) return;
+
+    if (entry.credentialsDuplicateOf || entry.claudeAccountDuplicateOf) {
+      const other = entry.credentialsDuplicateOf ?? entry.claudeAccountDuplicateOf;
+      this.warn(
+        `Profile "${name}" uses the same Claude login as "${other}". ` +
+          "Those profiles are not independent; logging in or out of one can invalidate the other.",
+      );
+      this.warn("Log this profile in with a different Anthropic account to run true parallel sessions.");
+    }
+  }
+
+  private warnForDuplicateEntries(entries: ParallelProfileEntry[]): void {
+    const duplicates = entries.filter((p) => p.credentialsDuplicateOf || p.claudeAccountDuplicateOf);
+    if (!duplicates.length) return;
+
+    for (const entry of duplicates) {
+      const other = entry.credentialsDuplicateOf ?? entry.claudeAccountDuplicateOf;
+      this.warn(
+        `Profile "${entry.name}" shares a Claude login with "${other}". ` +
+          "Use a different Anthropic account if these should run independently.",
+      );
+    }
   }
 
   private generateBashAliases(): string {
