@@ -25,6 +25,15 @@ import path from "node:path";
 // dist/tests/json-parity.test.js → dist/index.js
 const CLI_ENTRY = path.resolve(__dirname, "..", "index.js");
 
+// The `parallel --login` / `--run` tests below install a fake `claude` on PATH
+// as a `#!/bin/sh` script and rely on the CLI spawning it. On Windows that stub
+// is unreachable: `commandExists` only resolves PATHEXT extensions
+// (.EXE/.CMD/.BAT/.COM), `chmod` is a no-op, and cmd cannot execute a POSIX
+// shell script. The parallel feature itself ships sh/fish wrappers, so it is
+// POSIX-only; skip these stub-driven cases on win32.
+const SHELL_STUB_SKIP: string | false =
+  process.platform === "win32" ? "requires a POSIX /bin/sh `claude` stub on PATH" : false;
+
 interface CommandCase {
   // Human-readable id for the test name + result table.
   name: string;
@@ -293,7 +302,7 @@ test("parallel --list ignores stale Claude account UUID metadata", async () => {
   });
 });
 
-test("parallel --login can reject duplicate Claude accounts", async () => {
+test("parallel --login can reject duplicate Claude accounts", { skip: SHELL_STUB_SKIP }, async () => {
   await withSandbox(async (env) => {
     for (const profile of ["account1", "account2"]) {
       const added = runCli(["parallel", "--add", profile, "--json"], env);
@@ -349,7 +358,7 @@ test("parallel --login can reject duplicate Claude accounts", async () => {
   });
 });
 
-test("parallel --run isolates live Claude sessions and syncs changed login credentials", async () => {
+test("parallel --run isolates live Claude sessions and syncs changed login credentials", { skip: SHELL_STUB_SKIP }, async () => {
   await withSandbox(async (env) => {
     const added = runCli(["parallel", "--add", "account2", "--json"], env);
     assert.equal(added.status, 0, added.stderr);
@@ -430,7 +439,7 @@ test("parallel --run isolates live Claude sessions and syncs changed login crede
   });
 });
 
-test("parallel --run preserves session auth when sync lock is busy", async () => {
+test("parallel --run preserves session auth when sync lock is busy", { skip: SHELL_STUB_SKIP }, async () => {
   await withSandbox(async (env) => {
     const added = runCli(["parallel", "--add", "account2", "--json"], env);
     assert.equal(added.status, 0, added.stderr);
@@ -482,7 +491,7 @@ test("parallel --run preserves session auth when sync lock is busy", async () =>
   });
 });
 
-test("parallel --run preserves session auth when another session already changed the profile", async () => {
+test("parallel --run preserves session auth when another session already changed the profile", { skip: SHELL_STUB_SKIP }, async () => {
   await withSandbox(async (env) => {
     const added = runCli(["parallel", "--add", "account2", "--json"], env);
     assert.equal(added.status, 0, added.stderr);
