@@ -244,13 +244,18 @@ authmux parallel --login <name>   # Refresh Claude OAuth inside that profile
 authmux parallel --login <name> --fresh --require-distinct  # Reset stale Claude auth first and fail if it matches another profile
 authmux parallel --remove <name>  # Remove a profile
 authmux parallel --list           # List all profiles
+authmux parallel --sessions       # List per-session Claude config copies
+authmux parallel --clean-sessions # Remove stale inactive session copies
+authmux parallel --doctor         # Check wrappers, profiles, duplicates, sessions
 authmux parallel --aliases        # Print aliases (without installing)
 authmux parallel --install        # Write aliases to shell rc file
 ```
 
 ### How it works
 
-Each profile gets its own config directory at `~/.claude-accounts/<name>`. Shell aliases/functions launch Claude from a per-session copy of that profile, so already-open sessions keep their original credentials even after a later `/login`. If a session refreshes login credentials, Authmux syncs the changed Claude auth files back to `~/.claude-accounts/<name>` so future `claude-<name>` launches use the new login. `authmux parallel --install` writes Bash/Zsh aliases or Fish autoload functions based on `$SHELL`. Login and logout commands bypass Cue so refreshed OAuth tokens are written back to the right account directory. Generated login wrappers use `authmux parallel --login <name> --fresh --require-distinct`, which backs up stale Claude auth first and rejects a login that resolves to another configured profile. Run profiles in separate terminal tabs or tmux panes for true parallel usage.
+Each profile gets its own config directory at `~/.claude-accounts/<name>`. Shell aliases/functions launch Claude from a per-session copy of that profile, so already-open sessions keep their original credentials even after a later `/login`. If a session refreshes login credentials, Authmux syncs the changed Claude auth files back to `~/.claude-accounts/<name>` so future `claude-<name>` launches use the new login. That sync is serialized with a per-profile lock and writes auth files atomically with `0600` permissions. If another session already changed the canonical profile, Authmux keeps the session copy for recovery instead of overwriting newer credentials.
+
+`authmux parallel --sessions` shows live and stale session copies under `~/.claude-accounts-sessions`, and `authmux parallel --clean-sessions` removes inactive stale copies. `authmux parallel --doctor` checks that wrappers use the session-isolated runner, profiles have credentials, duplicates are visible, and stale sessions can be cleaned. `authmux parallel --install` writes Bash/Zsh aliases or Fish autoload functions based on `$SHELL`. Login and logout commands bypass Cue so refreshed OAuth tokens are written back to the right account directory. Generated login wrappers use `authmux parallel --login <name> --fresh --require-distinct`, which backs up stale Claude auth first and rejects a login that resolves to another configured profile. Run profiles in separate terminal tabs or tmux panes for true parallel usage.
 
 `authmux parallel --list` warns when two profiles contain the same Claude credentials or the same fresh Claude OAuth account UUID. Those profiles are not independent: logging in or out of one can invalidate the other because Claude sees them as the same account session. Re-run `authmux parallel --login <name> --fresh --require-distinct` and choose a different Anthropic account for any profile that should have its own subscription/session. If `.claude.json` is older than the active credentials, Authmux marks it as `claudeAccountState=stale` and does not use that stale UUID for duplicate-account detection.
 
