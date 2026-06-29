@@ -189,6 +189,57 @@ function runCli(argv: string[], env: NodeJS.ProcessEnv): { stdout: string; stder
   };
 }
 
+test("parallel --list flags duplicate Claude credentials", async () => {
+  await withSandbox(async (env) => {
+    for (const profile of ["account1", "account2"]) {
+      const added = runCli(["parallel", "--add", profile, "--json"], env);
+      assert.equal(added.status, 0, added.stderr);
+    }
+
+    const accountsDir = path.join(env.HOME as string, ".claude-accounts");
+    const credentials = JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "same-access-token",
+        refreshToken: "same-refresh-token",
+        expiresAt: 1782742285132,
+      },
+    });
+    const claudeState = JSON.stringify({
+      oauthAccount: {
+        accountUuid: "same-claude-account",
+      },
+    });
+
+    for (const profile of ["account1", "account2"]) {
+      const profileDir = path.join(accountsDir, profile);
+      await fsp.writeFile(path.join(profileDir, ".credentials.json"), credentials);
+      await fsp.writeFile(path.join(profileDir, ".claude.json"), claudeState);
+    }
+
+    const listed = runCli(["parallel", "--list", "--json"], env);
+    assert.equal(listed.status, 0, listed.stderr);
+
+    const parsed = JSON.parse(listed.stdout.trim()) as {
+      ok: true;
+      data: {
+        profiles: Array<{
+          name: string;
+          credentialsPresent: boolean;
+          credentialsDuplicateOf?: string;
+          claudeAccountDuplicateOf?: string;
+        }>;
+      };
+    };
+    const account1 = parsed.data.profiles.find((p) => p.name === "account1");
+    const account2 = parsed.data.profiles.find((p) => p.name === "account2");
+    assert.equal(account1?.credentialsPresent, true);
+    assert.equal(account1?.credentialsDuplicateOf, undefined);
+    assert.equal(account2?.credentialsPresent, true);
+    assert.equal(account2?.credentialsDuplicateOf, "account1");
+    assert.equal(account2?.claudeAccountDuplicateOf, "account1");
+  });
+});
+
 for (const tc of CASES) {
   test(`--json parity: ${tc.name}`, async () => {
     await withSandbox(async (env) => {
