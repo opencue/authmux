@@ -240,6 +240,55 @@ test("parallel --list flags duplicate Claude credentials", async () => {
   });
 });
 
+test("parallel --list ignores stale Claude account UUID metadata", async () => {
+  await withSandbox(async (env) => {
+    for (const profile of ["account1", "account2"]) {
+      const added = runCli(["parallel", "--add", profile, "--json"], env);
+      assert.equal(added.status, 0, added.stderr);
+    }
+
+    const accountsDir = path.join(env.HOME as string, ".claude-accounts");
+    const sharedClaudeState = JSON.stringify({
+      oauthAccount: {
+        accountUuid: "same-claude-account",
+      },
+    });
+    const account1Dir = path.join(accountsDir, "account1");
+    const account2Dir = path.join(accountsDir, "account2");
+    await fsp.writeFile(
+      path.join(account1Dir, ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "account1-token" } }),
+    );
+    await fsp.writeFile(path.join(account1Dir, ".claude.json"), sharedClaudeState);
+    await fsp.writeFile(path.join(account2Dir, ".claude.json"), sharedClaudeState);
+    const staleTime = new Date("2020-01-01T00:00:00Z");
+    await fsp.utimes(path.join(account2Dir, ".claude.json"), staleTime, staleTime);
+    await fsp.writeFile(
+      path.join(account2Dir, ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "account2-token" } }),
+    );
+
+    const listed = runCli(["parallel", "--list", "--json"], env);
+    assert.equal(listed.status, 0, listed.stderr);
+
+    const parsed = JSON.parse(listed.stdout.trim()) as {
+      ok: true;
+      data: {
+        profiles: Array<{
+          name: string;
+          claudeAccountStateStale: boolean;
+          credentialsDuplicateOf?: string;
+          claudeAccountDuplicateOf?: string;
+        }>;
+      };
+    };
+    const account2 = parsed.data.profiles.find((p) => p.name === "account2");
+    assert.equal(account2?.claudeAccountStateStale, true);
+    assert.equal(account2?.credentialsDuplicateOf, undefined);
+    assert.equal(account2?.claudeAccountDuplicateOf, undefined);
+  });
+});
+
 test("parallel --login can reject duplicate Claude accounts", async () => {
   await withSandbox(async (env) => {
     for (const profile of ["account1", "account2"]) {
