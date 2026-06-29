@@ -36,6 +36,7 @@ interface ParallelProfileEntry {
   skillProfile: string;
   cueProfile: string;
   credentialsPresent: boolean;
+  claudeAccountStateStale: boolean;
   credentialsDuplicateOf?: string;
   claudeAccountDuplicateOf?: string;
 }
@@ -154,18 +155,33 @@ function hashFileIfPresent(file: string): string | undefined {
   return hash.digest("hex");
 }
 
-function readClaudeAccountUuid(name: string): string | undefined {
+function statFileIfPresent(file: string): fs.Stats | undefined {
+  return fs.statSync(file, { throwIfNoEntry: false }) ?? undefined;
+}
+
+function readClaudeAccountUuid(name: string, credentialsMtimeMs?: number): {
+  uuid?: string;
+  stale: boolean;
+} {
   const file = claudeStatePathForProfile(name);
-  if (!fs.existsSync(file)) return undefined;
+  const stateStat = statFileIfPresent(file);
+  if (!stateStat) return { stale: false };
+
+  if (credentialsMtimeMs !== undefined && stateStat.mtimeMs < credentialsMtimeMs) {
+    return { stale: true };
+  }
 
   try {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as {
       oauthAccount?: { accountUuid?: unknown };
     };
     const uuid = parsed.oauthAccount?.accountUuid;
-    return typeof uuid === "string" && uuid.length > 0 ? uuid : undefined;
+    return {
+      uuid: typeof uuid === "string" && uuid.length > 0 ? uuid : undefined,
+      stale: false,
+    };
   } catch {
-    return undefined;
+    return { stale: false };
   }
 }
 
@@ -186,8 +202,10 @@ function buildProfileEntries(profiles = getProfiles()): ParallelProfileEntry[] {
   const seenClaudeAccountUuids = new Map<string, string>();
 
   return profiles.map((p) => {
-    const credentialHash = hashFileIfPresent(credentialsPathForProfile(p));
-    const claudeAccountUuid = readClaudeAccountUuid(p);
+    const credentialsPath = credentialsPathForProfile(p);
+    const credentialsStat = statFileIfPresent(credentialsPath);
+    const credentialHash = credentialsStat ? hashFileIfPresent(credentialsPath) : undefined;
+    const claudeAccount = readClaudeAccountUuid(p, credentialsStat?.mtimeMs);
 
     return {
       name: p,
@@ -195,8 +213,9 @@ function buildProfileEntries(profiles = getProfiles()): ParallelProfileEntry[] {
       skillProfile: readSkillProfile(p) ?? "base",
       cueProfile: readCueProfile(p) ?? readSkillProfile(p) ?? DEFAULT_CUE_PROFILE,
       credentialsPresent: Boolean(credentialHash),
+      claudeAccountStateStale: claudeAccount.stale,
       credentialsDuplicateOf: duplicateOwner(credentialHash, seenCredentialHashes, p),
-      claudeAccountDuplicateOf: duplicateOwner(claudeAccountUuid, seenClaudeAccountUuids, p),
+      claudeAccountDuplicateOf: duplicateOwner(claudeAccount.uuid, seenClaudeAccountUuids, p),
     };
   });
 }
@@ -411,6 +430,7 @@ export default class ClaudeParallel extends Command {
       const duplicateBits = [
         p.credentialsDuplicateOf ? `credentialsDuplicateOf=${p.credentialsDuplicateOf}` : undefined,
         p.claudeAccountDuplicateOf ? `claudeAccountDuplicateOf=${p.claudeAccountDuplicateOf}` : undefined,
+        p.claudeAccountStateStale ? "claudeAccountState=stale" : undefined,
       ].filter(Boolean);
       const duplicateSuffix = duplicateBits.length ? ` ${duplicateBits.join(" ")}` : "";
       this.log(
