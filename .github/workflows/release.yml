@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the current package version to npm
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Verify npm trusted-publishing support
+        run: |
+          npm_version="$(npm --version)"
+          node - "$npm_version" <<'NODE'
+          const [version] = process.argv.slice(2);
+          const [major, minor] = version.split(".").map(Number);
+          if (major < 11 || (major === 11 && minor < 5)) {
+            console.error(`npm ${version} cannot use OIDC trusted publishing; requires npm >=11.5.1`);
+            process.exit(1);
+          }
+          NODE
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Verify release contract
+        run: node --test test/release-contract.test.cjs
+
+      - name: Test
+        env:
+          CODEX_AUTH_SKIP_POSTINSTALL: "1"
+        run: npm test
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Verify release tag
+        if: github.event_name == 'release'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(node -p "require('./package.json').version")"
+          test "$tag" = "$version"
+
+      - name: Check npm registry
+        id: registry
+        run: |
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pack
+        run: npm pack --dry-run
+
+      - name: Publish to npm
+        if: steps.registry.outputs.exists != 'true' && (github.event_name == 'release' || inputs.publish == true)
+        run: npm publish --access public
