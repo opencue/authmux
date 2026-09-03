@@ -4,13 +4,12 @@ node_modules
 # multiagent-safety:START
 .omx/
 .omc/
+.codex/
 !.vscode/
 .vscode/*
 !.vscode/settings.json
-scripts/agent-session-state.js
 scripts/guardex-docker-loader.sh
 scripts/guardex-env.sh
-scripts/install-vscode-active-agents-extension.js
 .githooks
 oh-my-codex/
 .omx/state/agent-file-locks.json

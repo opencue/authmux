@@ -8,5 +8,7 @@
     "**/.omx/.tmp-worktrees",
     ".omc/.tmp-worktrees",
     "**/.omc/.tmp-worktrees"
-  ]
+  ],
+  "git.autoRepositoryDetection": "subFolders",
+  "git.detectWorktrees": false
 }
