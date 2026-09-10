@@ -301,8 +301,25 @@ function createProfileSessionDir(name: string): string {
   return sessionDir;
 }
 
-function copyProfileToSession(profileDir: string, sessionDir: string): void {
-  fs.cpSync(profileDir, sessionDir, { recursive: true });
+// Entries that must never be *copied* into the throwaway session dir. The dir is
+// deleted in the launch's `finally`, and only auth files are synced back to the
+// profile — so a copy of `projects` means every transcript Claude writes during
+// the session dies with it on exit (observed 2026-09-10: a full conversation
+// history lost this way). Link them to the profile instead: writes land in the
+// durable account dir, and the teardown's rmSync removes only the link.
+const SESSION_LINKED_ENTRIES = ["projects"] as const;
+
+export function copyProfileToSession(profileDir: string, sessionDir: string): void {
+  const linked = new Set<string>(SESSION_LINKED_ENTRIES);
+  fs.cpSync(profileDir, sessionDir, {
+    recursive: true,
+    filter: (src) => !linked.has(path.relative(profileDir, src)),
+  });
+  for (const name of SESSION_LINKED_ENTRIES) {
+    const target = path.join(profileDir, name);
+    fs.mkdirSync(target, { recursive: true });
+    fs.symlinkSync(target, path.join(sessionDir, name));
+  }
 }
 
 function hashFileIfPresent(file: string): string | undefined {
