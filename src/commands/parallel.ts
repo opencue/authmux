@@ -534,7 +534,7 @@ function buildProfileEntries(profiles = getProfiles()): ParallelProfileEntry[] {
       name: p,
       configDir: path.join(CLAUDE_PARALLEL_DIR, p),
       skillProfile: readSkillProfile(p) ?? "base",
-      cueProfile: readCueProfile(p) ?? readSkillProfile(p) ?? DEFAULT_CUE_PROFILE,
+      cueProfile: readCueProfile(p) ?? DEFAULT_CUE_PROFILE,
       credentialsPresent: Boolean(credentialHash),
       claudeAccountStateStale: claudeAccount.stale,
       credentialsDuplicateOf: duplicateOwner(credentialHash, seenCredentialHashes, p),
@@ -635,7 +635,12 @@ export default class ClaudeParallel extends Command {
     if (skillProfile) {
       writeSkillProfile(name, skillProfile);
     }
-    const resolvedCueProfile = cueProfile ?? readCueProfile(name) ?? skillProfile ?? DEFAULT_CUE_PROFILE;
+    // Deliberately does NOT fall back to `skillProfile`: a skill-profile name
+    // ("base", "frontend") is not a cue-profile name, and cue hard-errors on an
+    // unknown one (`cue launch: Profile "base" not found in profiles/`), which
+    // leaves the generated alias unable to start at all. Only an explicit
+    // `--cue-profile`, an already-recorded choice, or the sentinel default.
+    const resolvedCueProfile = cueProfile ?? readCueProfile(name) ?? DEFAULT_CUE_PROFILE;
     if (cueProfile || !readCueProfile(name)) {
       writeCueProfile(name, resolvedCueProfile);
     }

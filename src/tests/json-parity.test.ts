@@ -715,7 +715,9 @@ test("parallel aliases pass explicit cue profile per Claude account", async () =
     };
     assert.equal(parsedAdd.data.profile, "account2");
     assert.equal(parsedAdd.data.skillProfile, "frontend");
-    assert.equal(parsedAdd.data.cueProfile, "frontend");
+    // --skill-profile must NOT become the cue profile: "frontend" names a skill
+    // profile, and cue would reject it as an unknown profile at launch.
+    assert.equal(parsedAdd.data.cueProfile, "pick");
 
     const aliases = runCli(["parallel", "--aliases", "--shell", "bash", "--json"], env);
     assert.equal(aliases.status, 0, aliases.stderr);
@@ -740,7 +742,7 @@ test("parallel aliases pass explicit cue profile per Claude account", async () =
     );
     assert.match(
       parsedAliases.data.aliases,
-      /alias claude-account2="__authmux_claude_account 'account2' 'frontend' 'frontend'"/,
+      /alias claude-account2="__authmux_claude_account 'account2' 'frontend' 'pick'"/,
     );
   });
 });
