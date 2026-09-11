@@ -699,7 +699,9 @@ test("parallel aliases pass explicit cue profile per Claude account", async () =
     };
     assert.equal(parsedDefault.data.profile, "account1");
     assert.equal(parsedDefault.data.skillProfile, "base");
-    assert.equal(parsedDefault.data.cueProfile, "core");
+    // No explicit --cue-profile: the account records the "pick" sentinel so the
+    // generated alias runs `cue launch claude --cue-pick` and cue's picker opens.
+    assert.equal(parsedDefault.data.cueProfile, "pick");
 
     const add = runCli(
       ["parallel", "--add", "account2", "--skill-profile", "frontend", "--json"],

@@ -20,7 +20,15 @@ const CLAUDE_PARALLEL_SESSION_DIR = path.join(os.homedir(), ".claude-accounts-se
 const CLAUDE_PARALLEL_LOCK_DIR = path.join(os.homedir(), ".claude-accounts-locks");
 const SKILL_PROFILE_FILE = ".authmux-skill-profile";
 const CUE_PROFILE_FILE = ".authmux-cue-profile";
-const DEFAULT_CUE_PROFILE = "core";
+// "pick" is a sentinel, not a cue profile name: `resolveLaunchCommand` turns it
+// into `cue launch claude --cue-pick`, which opens cue's profile/skill picker.
+// Any other value becomes `cue launch claude --cue-profile <name>`, and an
+// explicit `--cue-profile` override makes cue skip the picker entirely
+// (`shouldForcePicker` returns false on `hasOverride`). So a concrete default
+// silently pins every new account to a profile the user never chose and hides
+// the picker forever. Defaulting to the sentinel means "no choice recorded yet
+// — ask"; a user who wants a fixed profile sets it via `--cue-profile <name>`.
+const DEFAULT_CUE_PROFILE = "pick";
 const SESSION_SYNC_INTERVAL_MS = 1_000;
 const DEFAULT_STALE_SESSION_MS = 24 * 60 * 60 * 1_000;
 const DEFAULT_FINAL_LOCK_WAIT_MS = 5_000;
