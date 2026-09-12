@@ -46,7 +46,9 @@ export function findRealClaudeBinary(options: FindClaudeBinaryOptions = {}): str
 
   for (const entry of pathEntries) {
     for (const extension of extensions) {
-      const candidate = path.join(entry, `claude${extension}`);
+      // Absolute, so a `.` PATH entry can't hand spawnSync a bare `claude` that
+      // would be re-resolved through PATH — and hit the shim we just skipped.
+      const candidate = path.resolve(entry, `claude${extension}`);
       let stat: fs.Stats;
       try {
         stat = fs.statSync(candidate);
@@ -60,4 +62,15 @@ export function findRealClaudeBinary(options: FindClaudeBinaryOptions = {}): str
     }
   }
   return undefined;
+}
+
+/**
+ * Node can't spawn a `.cmd`/`.bat` launcher (npm's Windows shim) directly;
+ * it needs cmd.exe behind it.
+ */
+export function needsWindowsCommandShell(
+  bin: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return platform === "win32" && /\.(cmd|bat)$/i.test(bin);
 }

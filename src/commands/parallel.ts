@@ -13,7 +13,7 @@ import {
   jsonSuccess,
   writeJsonEnvelope,
 } from "../lib/cli/json-envelope";
-import { findRealClaudeBinary } from "../lib/claude-binary";
+import { findRealClaudeBinary, needsWindowsCommandShell } from "../lib/claude-binary";
 
 const CLAUDE_PARALLEL_DIR = path.join(os.homedir(), ".claude-accounts");
 const CLAUDE_PARALLEL_BACKUP_DIR = path.join(os.homedir(), ".claude-accounts-backups");
@@ -711,6 +711,7 @@ export default class ClaudeParallel extends Command {
         ...process.env,
         CLAUDE_CONFIG_DIR: dir,
       },
+      shell: needsWindowsCommandShell(claudeBin),
     });
 
     if (result.error) {
