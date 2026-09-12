@@ -73,12 +73,19 @@ test("findRealClaudeBinary ignores missing PATH entries and directories named cl
 
 test("findRealClaudeBinary returns an absolute path for a relative PATH entry", async () => {
   await withTempRoot(async (root) => {
-    const real = await makeBinDir(root, "bin", "#!/bin/sh\necho real\n");
-    const relative = path.relative(process.cwd(), real);
-    assert.ok(!path.isAbsolute(relative));
-    const found = findRealClaudeBinary({ ...HOST_OPTS, pathValue: relative });
-    assert.equal(found, path.join(real, `claude${EXT}`));
-    assert.ok(found && path.isAbsolute(found));
+    await makeBinDir(root, "bin", "#!/bin/sh\necho real\n");
+    // chdir rather than path.relative: on a CI runner the repo and the temp
+    // dir can sit on different drives, where "relative" comes back absolute.
+    const previousCwd = process.cwd();
+    process.chdir(root);
+    try {
+      const found = findRealClaudeBinary({ ...HOST_OPTS, pathValue: "bin" });
+      // process.cwd() after chdir is the canonical form (macOS tmp is a symlink).
+      assert.equal(found, path.join(process.cwd(), "bin", `claude${EXT}`));
+      assert.ok(found && path.isAbsolute(found));
+    } finally {
+      process.chdir(previousCwd);
+    }
   });
 });
 
