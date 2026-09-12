@@ -13,10 +13,15 @@ const CUE_SHIM = [
   "",
 ].join("\n");
 
-async function makeBinDir(root: string, name: string, content: string): Promise<string> {
+// The cue-shim tests are platform-agnostic; on Windows PATH entries carry a
+// drive colon, so join with the host delimiter and resolve as the host.
+const HOST = process.platform;
+const POSIX_ONLY_SKIP = HOST === "win32" ? "POSIX execute bits do not apply on Windows" : false;
+
+async function makeBinDir(root: string, name: string, content: string, mode = 0o755): Promise<string> {
   const dir = path.join(root, name);
   await fsp.mkdir(dir, { recursive: true });
-  await fsp.writeFile(path.join(dir, "claude"), content, { mode: 0o755 });
+  await fsp.writeFile(path.join(dir, "claude"), content, { mode });
   return dir;
 }
 
@@ -25,7 +30,7 @@ test("findRealClaudeBinary skips cue's shim and returns the next claude on PATH"
   try {
     const shims = await makeBinDir(root, "shims", CUE_SHIM);
     const real = await makeBinDir(root, "bin", "#!/bin/sh\necho real\n");
-    const found = findRealClaudeBinary({ pathValue: [shims, real].join(":"), platform: "linux" });
+    const found = findRealClaudeBinary({ pathValue: [shims, real].join(path.delimiter), platform: HOST });
     assert.equal(found, path.join(real, "claude"));
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
@@ -38,7 +43,7 @@ test("findRealClaudeBinary returns undefined when only the cue shim is on PATH",
     const shims = await makeBinDir(root, "shims", CUE_SHIM);
     const empty = path.join(root, "empty");
     await fsp.mkdir(empty);
-    const found = findRealClaudeBinary({ pathValue: [shims, empty].join(":"), platform: "linux" });
+    const found = findRealClaudeBinary({ pathValue: [shims, empty].join(path.delimiter), platform: HOST });
     assert.equal(found, undefined);
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
@@ -53,9 +58,21 @@ test("findRealClaudeBinary ignores missing PATH entries and directories named cl
     const real = await makeBinDir(root, "bin", "#!/bin/sh\necho real\n");
     const missing = path.join(root, "does-not-exist");
     const found = findRealClaudeBinary({
-      pathValue: [missing, dirNamedClaude, real].join(":"),
-      platform: "linux",
+      pathValue: [missing, dirNamedClaude, real].join(path.delimiter),
+      platform: HOST,
     });
+    assert.equal(found, path.join(real, "claude"));
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("findRealClaudeBinary skips a non-executable claude ahead of a real one", { skip: POSIX_ONLY_SKIP }, async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "authmux-claude-bin-"));
+  try {
+    const notExec = await makeBinDir(root, "notexec", "#!/bin/sh\necho nope\n", 0o644);
+    const real = await makeBinDir(root, "bin", "#!/bin/sh\necho real\n");
+    const found = findRealClaudeBinary({ pathValue: [notExec, real].join(path.delimiter), platform: HOST });
     assert.equal(found, path.join(real, "claude"));
   } finally {
     await fsp.rm(root, { recursive: true, force: true });

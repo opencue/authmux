@@ -14,6 +14,15 @@ export type FindClaudeBinaryOptions = {
   pathExt?: string;
 };
 
+function isExecutable(candidate: string): boolean {
+  try {
+    fs.accessSync(candidate, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function isCueShim(candidate: string, size: number): boolean {
   if (size >= MAX_SHIM_SCRIPT_BYTES) return false;
   try {
@@ -45,6 +54,7 @@ export function findRealClaudeBinary(options: FindClaudeBinaryOptions = {}): str
         continue;
       }
       if (!stat.isFile()) continue;
+      if (platform !== "win32" && !isExecutable(candidate)) continue;
       if (isCueShim(candidate, stat.size)) continue;
       return candidate;
     }
