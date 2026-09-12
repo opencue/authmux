@@ -13,6 +13,7 @@ import {
   jsonSuccess,
   writeJsonEnvelope,
 } from "../lib/cli/json-envelope";
+import { findRealClaudeBinary, needsWindowsCommandShell } from "../lib/claude-binary";
 
 const CLAUDE_PARALLEL_DIR = path.join(os.homedir(), ".claude-accounts");
 const CLAUDE_PARALLEL_BACKUP_DIR = path.join(os.homedir(), ".claude-accounts-backups");
@@ -692,28 +693,35 @@ export default class ClaudeParallel extends Command {
       this.log(`Backed up existing Claude auth for "${name}" to ${existingBackup.dir}.`);
     }
 
+    // Spawn the real CLI, not cue's shim: the shim routes into `cue launch`,
+    // which relocates CLAUDE_CONFIG_DIR to cue's runtime dir, so the login
+    // would never land in `dir`. `claude login` is not a subcommand either —
+    // Claude Code takes it as the opening prompt; `auth login` is the real one.
+    const claudeBin = findRealClaudeBinary();
+    if (!claudeBin) {
+      restoreProfileAuthBackup(existingBackup);
+      this.error("`claude` CLI was not found in PATH. Install Claude Code first, then retry.");
+    }
+
     const credentialsPath = credentialsPathForProfile(name);
     const before = fs.statSync(credentialsPath, { throwIfNoEntry: false })?.mtimeMs ?? 0;
-    const result = spawnSync("claude", ["login"], {
+    const result = spawnSync(claudeBin, ["auth", "login"], {
       stdio: "inherit",
       env: {
         ...process.env,
         CLAUDE_CONFIG_DIR: dir,
       },
+      shell: needsWindowsCommandShell(claudeBin),
     });
 
     if (result.error) {
       restoreProfileAuthBackup(existingBackup);
-      const err = result.error as NodeJS.ErrnoException;
-      if (err.code === "ENOENT") {
-        this.error("`claude` CLI was not found in PATH. Install Claude Code first, then retry.");
-      }
       throw result.error;
     }
 
     if (result.status !== 0) {
       restoreProfileAuthBackup(existingBackup);
-      this.error(`\`claude login\` failed with exit code ${result.status ?? "unknown"}.`);
+      this.error(`\`claude auth login\` failed with exit code ${result.status ?? "unknown"}.`);
     }
 
     const after = fs.statSync(credentialsPath, { throwIfNoEntry: false });
