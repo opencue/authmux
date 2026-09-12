@@ -334,7 +334,8 @@ test("parallel --login can reject duplicate Claude accounts", { skip: SHELL_STUB
       [
         "#!/bin/sh",
         "set -eu",
-        "test \"${1:-}\" = login",
+        "test \"${1:-}\" = auth",
+        "test \"${2:-}\" = login",
         "mkdir -p \"$CLAUDE_CONFIG_DIR\"",
         `printf '%s' '${duplicateCredentials}' > "$CLAUDE_CONFIG_DIR/.credentials.json"`,
         `printf '%s' '${duplicateClaudeState}' > "$CLAUDE_CONFIG_DIR/.claude.json"`,
