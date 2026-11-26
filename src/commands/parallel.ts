@@ -320,14 +320,18 @@ const SESSION_LINKED_ENTRIES = ["projects"] as const;
 
 export function copyProfileToSession(profileDir: string, sessionDir: string): void {
   const linked = new Set<string>(SESSION_LINKED_ENTRIES);
-  fs.cpSync(profileDir, sessionDir, {
-    recursive: true,
-    filter: (src) => !linked.has(path.relative(profileDir, src)),
-  });
+  // Compare entry names, not paths: Windows can expand a short temp path
+  // inside cpSync, making it look unrelated to the original profile path.
+  const entries = fs.readdirSync(profileDir);
+  fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+  for (const name of entries) {
+    if (linked.has(process.platform === "win32" ? name.toLowerCase() : name)) continue;
+    fs.cpSync(path.join(profileDir, name), path.join(sessionDir, name), { recursive: true });
+  }
   for (const name of SESSION_LINKED_ENTRIES) {
     const target = path.join(profileDir, name);
     fs.mkdirSync(target, { recursive: true });
-    fs.symlinkSync(target, path.join(sessionDir, name));
+    fs.symlinkSync(path.resolve(target), path.join(sessionDir, name), process.platform === "win32" ? "junction" : "dir");
   }
 }
 
