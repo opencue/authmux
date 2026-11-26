@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -12,6 +13,8 @@ permissions:
 jobs:
   test:
     name: test (${{ matrix.os }}, node-${{ matrix.node }})
+    env:
+      AUTHMUX_SKIP_POSTBUILD_PARALLEL_INSTALL: "1"
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -29,8 +32,6 @@ jobs:
       - run: npm ci --ignore-scripts
         env:
           CODEX_AUTH_SKIP_POSTINSTALL: "1"
-
-      - run: npm run build
 
       - run: npm test
         env:
